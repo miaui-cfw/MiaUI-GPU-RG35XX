@@ -16,7 +16,8 @@ case "$1" in
 	mkdir /tmp/udev
 	mkdir /tmp/lock
 
-	mount -t ext4 -o noatime,nodiratime,errors=continue /dev/mmcblk0p3 /userdata
+	# The ramdisk's /cfw.sh mounts /userdata now (after its boot check); an older ramdisk doesn't
+	grep -q " /userdata " /proc/mounts || mount -t ext4 -o noatime,nodiratime,errors=continue /dev/mmcblk0p3 /userdata
     ;;
     stop)
 	sync

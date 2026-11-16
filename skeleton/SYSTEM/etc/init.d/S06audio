@@ -5,7 +5,6 @@
 
 case "$1" in
     start)
-	value="$(batocera-settings-get audio.volume)"
         alsactl init # init cards with alsa files
 	alsactl restore 0 -f /userdata/Profile/.asound.state
 #        amixer sset 'speaker on off switch' 'on'
