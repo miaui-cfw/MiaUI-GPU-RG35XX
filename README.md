@@ -28,7 +28,6 @@ The most common point of failure in retro handhelds is SD card corruption. This 
 
 * **Read-Only System Architecture**: The entire MinUI system and core binaries have been moved to /opt. The goal is to keep the OS partition strictly Read-Only, leaving the ROMs partition exclusively for your games, saves and user profile.
 * **Aggressive /tmp Utilization**: Features that require constant background writing (like the "Recent Games" list) have been rerouted to volatile RAM (/tmp). This means your "Recents" will reset on reboot, but your SD card's lifespan is extended. (Tip: Use "Collections" for persistent favorites!)
-* **Safe Force-Shutdown**: Keymon has been updated. Pressing [MENU]+[POWER] forces a hardware-safe shutdown at any time, even if any software you launched freezes, ensuring filesystem integrity.
 * **EXT4 Exclusive:** There is no FAT32 support for the ROMs partition. FAT32 is prone to corruption and slows down boot times. We use ext4 strictly for maximum speed and reliability. **For Windows users, our #1 recommendation is to transfer games using the built-in WEB Manager via USB** ([more info](#-usb-networking--web-manager)). Based on our experience, it is the most reliable, problem-free method. But you *can* use third-party tools to [read](https://www.diskinternals.com/linux-reader/) or [write](https://www.diskinternals.com/linux-writer/) the ext4 SD card directly.
 
 ## 🚀 Unleash the RG35XX power!
