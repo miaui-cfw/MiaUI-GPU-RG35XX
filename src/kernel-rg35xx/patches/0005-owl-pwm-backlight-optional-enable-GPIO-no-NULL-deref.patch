@@ -1,0 +1,60 @@
+From 00c0075260f61d1edc2c940266d8df0aaeb3e39f Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 19:16:50 +0100
+Subject: [PATCH 5/7] owl pwm backlight: optional enable GPIO, no NULL
+ dereference
+
+Matches the running RG35XX kernel:
+- the enable GPIO is requested and driven only when the DT has one (the
+  RG35XX DTS has no backlight_en_gpios);
+- owl_backlight_set_onoff() returns when no backlight is registered (the
+  public source printed an error and dereferenced it anyway).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/owl/backlight/owl_pwm_bl.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/owl/backlight/owl_pwm_bl.c b/drivers/video/owl/backlight/owl_pwm_bl.c
+index 748ba4ac..ce1dfca3 100755
+--- a/drivers/video/owl/backlight/owl_pwm_bl.c
++++ b/drivers/video/owl/backlight/owl_pwm_bl.c
+@@ -406,7 +406,9 @@ static int owl_pwm_bl_probe(struct platform_device *pdev) {
+     pb->en_gpio.gpio        = data->en_gpio.gpio;
+     pb->en_gpio.active_low  = data->en_gpio.active_low;
+ 
+-    gpio_request(pb->en_gpio.gpio, NULL);
++    /* RG35XX: the enable GPIO is optional (none in the RG35XX DTS) */
++    if (gpio_is_valid(pb->en_gpio.gpio))
++        gpio_request(pb->en_gpio.gpio, NULL);
+ 
+     check_boot_pwm_inited(pb->pwm->hwpwm);
+ 
+@@ -443,12 +445,14 @@ static int owl_pwm_bl_probe(struct platform_device *pdev) {
+     bl->props.brightness = data->dft_brightness - pb->threshold_step;
+ 
+     if (boot_pwm_inited) {
+-        gpio_direction_output(pb->en_gpio.gpio, !pb->en_gpio.active_low);
++        if (gpio_is_valid(pb->en_gpio.gpio))
++            gpio_direction_output(pb->en_gpio.gpio, !pb->en_gpio.active_low);
+ 
+         bl->props.power = FB_BLANK_UNBLANK;
+         pb->dev_enable  = 1;
+     } else {
+-        gpio_direction_output(pb->en_gpio.gpio, pb->en_gpio.active_low);
++        if (gpio_is_valid(pb->en_gpio.gpio))
++            gpio_direction_output(pb->en_gpio.gpio, pb->en_gpio.active_low);
+ 
+         bl->props.power = FB_BLANK_POWERDOWN;
+         pb->dev_enable = 0;
+@@ -607,6 +611,7 @@ void owl_backlight_set_onoff(int onoff) {
+ 	struct owl_pwm_bl *pb = NULL;
+     if (NULL == bl) {
+         printk("ERROR! backlight is no exist!\n");
++        return;	/* RG35XX: the public source went on to dereference it */
+     }
+     pb = dev_get_drvdata(&bl->dev)
+ 
+-- 
+2.53.0
+

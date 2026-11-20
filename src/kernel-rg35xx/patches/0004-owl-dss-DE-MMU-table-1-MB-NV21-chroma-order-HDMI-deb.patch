@@ -1,0 +1,62 @@
+From 0de32d0e3287ae781085a78edc7948cc2f815f84 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 18:56:08 +0100
+Subject: [PATCH 4/7] owl dss: DE MMU table 1 MB, NV21 chroma order, HDMI debug
+ off
+
+Matches the running RG35XX kernel:
+- DE MMU table 1 MB instead of 4 MB (3 MB less DMA memory).
+- planar YUV420 setup swaps the chroma planes for NV21 (the public source
+  tested NV12, which never reaches that case).
+- HDMI debug printks off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/owl/displays/hdmi/hdmi.h | 2 +-
+ drivers/video/owl/dss/de.c             | 3 ++-
+ drivers/video/owl/dss/mmu.c            | 2 +-
+ 3 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/owl/displays/hdmi/hdmi.h b/drivers/video/owl/displays/hdmi/hdmi.h
+index 2957f165..59add2bc 100755
+--- a/drivers/video/owl/displays/hdmi/hdmi.h
++++ b/drivers/video/owl/displays/hdmi/hdmi.h
+@@ -43,7 +43,7 @@
+ #define DEBUG_ERR(format, ...)
+ #endif
+ 
+-#define DEBUG
++#define DEBUGx	/* RG35XX: HDMI debug printks off, as in the running kernel */
+ #ifdef DEBUG
+ #define HDMI_DEBUG(format, ...) \
+ 	do { \
+diff --git a/drivers/video/owl/dss/de.c b/drivers/video/owl/dss/de.c
+index 92309a29..b8465e59 100755
+--- a/drivers/video/owl/dss/de.c
++++ b/drivers/video/owl/dss/de.c
+@@ -685,7 +685,8 @@ int de_ovl_setup(enum owl_de_path_id channel, enum owl_plane plane,
+ 
+ 		de_ops->fb_addr_set(plane, DE_VIDEO_FB0, ba0);
+ 
+-		if (oi->color_mode == OWL_DSS_COLOR_NV12) {
++		/* RG35XX: NV21 swaps the chroma planes (the public source tested NV12, which never reaches this case) */
++		if (oi->color_mode == OWL_DSS_COLOR_NV21) {
+ 			de_ops->fb_addr_set(plane, DE_VIDEO_FB1, ba2);
+ 			de_ops->fb_addr_set(plane, DE_VIDEO_FB2, ba1);
+ 		} else {
+diff --git a/drivers/video/owl/dss/mmu.c b/drivers/video/owl/dss/mmu.c
+index 5b9dc644..6dc6c0ad 100755
+--- a/drivers/video/owl/dss/mmu.c
++++ b/drivers/video/owl/dss/mmu.c
+@@ -34,7 +34,7 @@
+ #include "dss.h"
+ #include "de.h"
+ static DEFINE_MUTEX(MMU_lock);
+-#define MMU_TABLE_SIZE		(4 * 1024 * 1024)
++#define MMU_TABLE_SIZE		(1 * 1024 * 1024)	/* RG35XX: 1 MB (256K pages, 1 GB of buffers) */
+ 
+ /*
+  * MMU entry used to convert virtaul address or ION fd
+-- 
+2.53.0
+

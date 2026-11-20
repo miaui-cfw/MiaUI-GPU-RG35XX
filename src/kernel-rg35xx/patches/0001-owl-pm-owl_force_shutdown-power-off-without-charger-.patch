@@ -1,0 +1,73 @@
+From 6bd65bd858ad7c17cefa58578a7fae14367dcb75 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 17:55:29 +0100
+Subject: [PATCH 1/7] owl pm: owl_force_shutdown(), power off without charger
+ wake-up
+
+Recovered from the RG35XX running kernel (3.10.37 ctalon #40, binary only).
+owl_force_shutdown() sets a flag that owl_pm_halt() checks: with a battery
+connected the wall / VBUS wake-up sources are then left out, so a charger
+plugged in after a protective power-off (battery over/under temperature in
+atc260x_power) cannot switch the console back on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/mach-owl/include/mach/power.h |  1 +
+ arch/arm/mach-owl/pm-owl.c             | 22 ++++++++++++++++++++--
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/mach-owl/include/mach/power.h b/arch/arm/mach-owl/include/mach/power.h
+index b802af81..6448e681 100755
+--- a/arch/arm/mach-owl/include/mach/power.h
++++ b/arch/arm/mach-owl/include/mach/power.h
+@@ -97,6 +97,7 @@ extern void fs_drop_page_caches(void);
+ extern int cpu_package(void);
+ extern int owl_pm_wakeup_flag(void);
+ extern int set_judge_adapter_type_handle(void* handle);
++extern void owl_force_shutdown(void);
+ 
+ /* for PMIC operations ------------------------------------------------------ */
+ 
+diff --git a/arch/arm/mach-owl/pm-owl.c b/arch/arm/mach-owl/pm-owl.c
+index b770b468..9aa70f6d 100755
+--- a/arch/arm/mach-owl/pm-owl.c
++++ b/arch/arm/mach-owl/pm-owl.c
+@@ -87,6 +87,19 @@ int set_judge_adapter_type_handle(void *handle)
+ }
+ EXPORT_SYMBOL_GPL(set_judge_adapter_type_handle);
+ 
++/* RG35XX: set by owl_force_shutdown(), read by owl_pm_halt() */
++static int force_shutdown;
++
++/**
++ * @brief Marks the coming power-off as protective: owl_pm_halt() then leaves out the wall / VBUS wake-up sources,
++ *        so a plugged charger cannot power the console back on (used by the battery temperature protection).
++ */
++void owl_force_shutdown(void)
++{
++	force_shutdown = 1;
++}
++EXPORT_SYMBOL_GPL(owl_force_shutdown);
++
+ 
+ void system_powerdown_withgpio(void)
+ {
+@@ -166,8 +179,13 @@ void owl_pm_halt(void)
+ 	wakeup_src = OWL_PMIC_WAKEUP_SRC_RESET |
+ 		OWL_PMIC_WAKEUP_SRC_ONOFF_LONG;
+ 	
+-	if(owl_pm_is_battery_connected())
+-		wakeup_src |= OWL_PMIC_WAKEUP_SRC_WALL_IN | OWL_PMIC_WAKEUP_SRC_VBUS_IN;
++	if(owl_pm_is_battery_connected()) {
++		/* RG35XX: a protective power-off must not be undone by the charger */
++		if (force_shutdown)
++			pr_err("force shutdown not set wall&vbush wakeup src\n");
++		else
++			wakeup_src |= OWL_PMIC_WAKEUP_SRC_WALL_IN | OWL_PMIC_WAKEUP_SRC_VBUS_IN;
++	}
+ 
+ 	/* if wall/usb is connect, cannot enter S4, only can enter S3 */
+ 	deep_pwrdn = 0;
+-- 
+2.53.0
+

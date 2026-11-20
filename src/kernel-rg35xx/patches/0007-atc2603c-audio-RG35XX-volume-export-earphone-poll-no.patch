@@ -1,0 +1,351 @@
+From 0b90853a191e2c890e27210999d1dc033767923d Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 21:46:50 +0100
+Subject: [PATCH 7/7] atc2603c audio: RG35XX volume export, earphone poll, no
+ SPDIF
+
+What the console's own modules and speaker/headphone path need, matching
+the running RG35XX kernel:
+- allen_adjust_volume(write, value), exported: reads/sets the DAC PA
+  volume (DAC_ANALOG1 bits 5:0); the gpio_keys_polled gamepad module on
+  the rootfs calls it for the volume keys and does not load without it;
+- playback controls apply that volume, digital volume 0xB5 and PA output
+  swing;
+- earphone_detect_method 3 (the RG35XX DTS): both detect pins
+  (earphone_detect_gpios, and earphone_detect_gpios_new of the newer
+  board) polled every 500 ms, h2w switch in the codec, speaker PA
+  switched by the poll; poll stopped on suspend/remove, restarted on
+  resume;
+- speaker PA off at shutdown (the public source switched it on);
+- no SPDIF: not selected by SND_SOC_ALL_PMU_OWL, no SPDIF dai link.
+
+Not ported (no Bluetooth on this console; to revisit if audio differs):
+the vendor's Bluetooth PCM card device (hw:0,2), its S900-style DAI and
+PCM/DMA rework, the input-mode control and the deferred link init.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sound/soc/atc260x/Kconfig                     |   1 -
+ .../atc2603c-codec/atc2603c-audio-codec.c     | 135 ++++++++++++++++--
+ sound/soc/atc260x/link-owl.c                  |  43 ++++--
+ 3 files changed, 155 insertions(+), 24 deletions(-)
+
+diff --git a/sound/soc/atc260x/Kconfig b/sound/soc/atc260x/Kconfig
+index 5a642279..f98ee6cc 100755
+--- a/sound/soc/atc260x/Kconfig
++++ b/sound/soc/atc260x/Kconfig
+@@ -27,7 +27,6 @@ config SND_SOC_ALL_PMU_OWL
+ 	tristate "SoC Audio support for all pmus owl board"
+ 	select SND_SOC_OWL
+ 	select SND_SOC_HDMI_OWL
+-	select SND_SOC_SPDIF_OWL
+ 	select SND_SOC_DAI_OWL
+ 	select SND_SOC_ATC2603A
+ 	select SND_SOC_ATC2603C
+diff --git a/sound/soc/atc260x/atc2603c-codec/atc2603c-audio-codec.c b/sound/soc/atc260x/atc2603c-codec/atc2603c-audio-codec.c
+index 6c1ba6ae..ffe96c0a 100755
+--- a/sound/soc/atc260x/atc2603c-codec/atc2603c-audio-codec.c
++++ b/sound/soc/atc260x/atc2603c-codec/atc2603c-audio-codec.c
+@@ -59,6 +59,13 @@ static const char *snd_adc_level = "adc_level";
+ 
+ static int speaker_gpio_num;
+ static int earphone_gpio_num;
++/* RG35XX: detect pin of the newer board revision (DT earphone_detect_gpios_new) */
++static int earphone_gpio_num_new = -1;
++static const char *earphone_detect_gpio_new = "earphone_detect_gpios_new";
++/* RG35XX: DAC PA volume (DAC_ANALOG1 bits 5:0), set by allen_adjust_volume() */
++static int allen_volume = 40;
++/* RG35XX: speaker PA state driven by asoc_earphone_poll() */
++static int allen_enable_spk;
+ 
+ static enum of_gpio_flags speaker_gpio_level;
+ static int speaker_gpio_active;
+@@ -198,6 +205,8 @@ static irqreturn_t earphone_detect_irq_handler(int irq, void *data);
+ extern void snd_antipop_i2s_clk_set(void);
+ 
+ static struct delayed_work dwork_adc_detect;
++/* RG35XX: earphone_detect_method 3, see asoc_earphone_poll() */
++static struct delayed_work dwork_poll;
+ 
+ 
+ /* 
+@@ -688,15 +697,54 @@ const struct snd_kcontrol_new atc2603c_snd_controls[] = {
+ 
+ };
+ #ifdef CONFIG_SND_UBUNTU
++/**
++ * @brief Playback path setup.
++ * @param codec The codec.
++ * @return 0.
++ *
++ * RG35XX: PA volume from allen_volume, digital volume 0xB5 on both channels and PA output swing on, as in the
++ * running kernel.
++ */
+ static int atc2603c_playback_set_controls(struct snd_soc_codec *codec)
+ {
+-  
++    snd_soc_update_bits(codec, DAC_ANALOG1, 0x3f << DAC_ANALOG1_VOLUME_SFT, allen_volume << DAC_ANALOG1_VOLUME_SFT);
++    snd_soc_update_bits(codec, DAC_VOLUMECTL0, 0xff << DAC_VOLUMECTL0_DACFL_VOLUME_SFT, DAC_VOLUMECTL0_DACFL_VOLUME(0xb5));
++    snd_soc_update_bits(codec, DAC_VOLUMECTL0, 0xff << DAC_VOLUMECTL0_DACFR_VOLUME_SFT, DAC_VOLUMECTL0_DACFR_VOLUME(0xb5));
+     snd_soc_update_bits(codec, DAC_ANALOG3, 0x1 << DAC_ANALOG3_PAEN_FR_FL_SFT, 0x01 << DAC_ANALOG3_PAEN_FR_FL_SFT);
+     snd_soc_update_bits(codec, DAC_ANALOG3, 0x1 << DAC_ANALOG3_PAOSEN_FR_FL_SFT, 0x01 << DAC_ANALOG3_PAOSEN_FR_FL_SFT);
+     snd_soc_update_bits(codec, DAC_DIGITALCTL, 0x03 << DAC_DIGITALCTL_DEFL_SFT, 0x03 << DAC_DIGITALCTL_DEFL_SFT);
+-  
++    snd_soc_update_bits(codec, DAC_ANALOG1, 0x1 << DAC_ANALOG1_PASW_SFT, 0x1 << DAC_ANALOG1_PASW_SFT);
++
+     snd_soc_update_bits(codec, DAC_ANALOG3, 0x03 << 0, 0x03);
++    return 0;
++}
++
++/**
++ * @brief RG35XX: reads or sets the DAC PA volume (exported for the gpio_keys_polled gamepad module).
++ * @param write 1 to set @p value, 0 to read.
++ * @param value New volume, 0..63 (only with @p write).
++ * @return The current volume when reading (or the register read error), 0 after a write.
++ */
++int allen_adjust_volume(int write, int value)
++{
++	int ret;
++
++	ret = atc260x_reg_read(atc260x, DAC_ANALOG1 + REG_BASE);
++	if (ret < 0) {
++		printk("atc2603c_read: ret = %d failed\n", ret);
++		return write ? 0 : ret;
++	}
++	if (!write)
++		return ret & 0x3f;
++
++	value &= 0x3f;
++	ret = atc260x_reg_write(atc260x, DAC_ANALOG1 + REG_BASE, (ret & 0xffc0) | value);
++	if (ret < 0)
++		printk("atc2603c_write: ret = %d failed\n", ret);
++	allen_volume = value;
++	return 0;
+ }
++EXPORT_SYMBOL(allen_adjust_volume);
+ 
+ static int atc2603c_capture_set_controls(struct snd_soc_codec *codec)
+ {
+@@ -1658,6 +1706,38 @@ static int atc2603c_probe(struct snd_soc_codec *codec)
+    return 0;
+ }
+ 
++/**
++ * @brief RG35XX: earphone_detect_method 3, every 500 ms: reports the headset on h2w and switches the speaker PA.
++ * @param work dwork_poll.
++ *
++ * The earphone is in when a detect pin reads high, except while its board revision's GPIO trio (16, 19, 20 for
++ * earphone_detect_gpios, 71, 72, 73 for earphone_detect_gpios_new) all read low; the DT active flags are not used.
++ * Same logic as the running kernel.
++ */
++static void asoc_earphone_poll(struct work_struct *work)
++{
++	bool masked = !gpio_get_value(16) && !gpio_get_value(19) && !gpio_get_value(20);
++	bool masked_new = !gpio_get_value(71) && !gpio_get_value(72) && !gpio_get_value(73);
++	bool in = false;
++
++	if (gpio_is_valid(earphone_gpio_num) && gpio_get_value(earphone_gpio_num) && !masked)
++		in = true;
++	if (gpio_is_valid(earphone_gpio_num_new) && gpio_get_value(earphone_gpio_num_new) && !masked_new)
++		in = true;
++
++	switch_set_state(&headphone_sdev, in);
++	if (speaker_gpio_num >= 0) {
++		if (in && allen_enable_spk) {
++			gpio_direction_output(speaker_gpio_num, !speaker_gpio_active);
++			allen_enable_spk = 0;
++		} else if (!in && !allen_enable_spk) {
++			gpio_direction_output(speaker_gpio_num, speaker_gpio_active);
++			allen_enable_spk = 1;
++		}
++	}
++	queue_delayed_work(system_wq, &dwork_poll, msecs_to_jiffies(500));
++}
++
+ static int atc2603c_remove(struct snd_soc_codec *codec)
+ {
+ 	if (earphone_irq != -1)
+@@ -1672,6 +1752,8 @@ static int atc2603c_remove(struct snd_soc_codec *codec)
+ 	{
+ 		cancel_delayed_work_sync(&dwork_adc_detect);	
+ 	}
++	if (audio_hw_cfg.earphone_detect_method == 3)	/* RG35XX */
++		cancel_delayed_work_sync(&dwork_poll);
+ 	return 0;
+ }
+ 
+@@ -1731,6 +1813,8 @@ static int atc2603c_suspend(struct snd_soc_codec *codec)
+ 	{
+ 		cancel_delayed_work_sync(&dwork_adc_detect);
+ 	}
++	if (audio_hw_cfg.earphone_detect_method == 3)	/* RG35XX */
++		cancel_delayed_work_sync(&dwork_poll);
+ 	return 0;
+ }
+ 
+@@ -1760,6 +1844,8 @@ static int atc2603c_resume(struct snd_soc_codec *codec)
+ 		schedule_delayed_work(&dwork_adc_detect, msecs_to_jiffies(500));
+ 		atc2603c_adckeypad_config(codec);	
+ 	}
++	if (audio_hw_cfg.earphone_detect_method == 3)	/* RG35XX */
++		queue_delayed_work(system_wq, &dwork_poll, msecs_to_jiffies(500));
+ #ifdef CONFIG_SND_UBUNTU  //suspend/resume
+     if(atc2603c_open_count > 0){
+         atc2603c_playback_set_controls(codec);
+@@ -2058,10 +2144,9 @@ static int atc2603c_platform_remove(struct platform_device *pdev)
+ 
+ static void atc2603c_platform_shutdown(struct platform_device *pdev)
+ {	
+-	if(speaker_gpio_num > 0){
+-	
+-		gpio_direction_output(speaker_gpio_num, speaker_gpio_active);
+-	}
++	/* RG35XX: speaker PA off before power-off (the public source switched it on) */
++	if (gpio_is_valid(speaker_gpio_num))
++		gpio_direction_output(speaker_gpio_num, !speaker_gpio_active);
+ /*
+ 	snd_soc_write(atc2603c_codec, DAC_VOLUMECTL0, 0xBEBE);
+ 	snd_soc_write(atc2603c_codec, DAC_ANALOG1, 0x0);
+@@ -2212,10 +2297,31 @@ static int atc2603c_get_cfg(void)
+ 	speaker_gpio_active = (speaker_gpio_level & OF_GPIO_ACTIVE_LOW);
+ 			
+ 	earphone_gpio_num = of_get_named_gpio_flags(dn, earphone_detect_gpio, 0, NULL);
+-	if (earphone_gpio_num < 0) {
++	earphone_gpio_num_new = of_get_named_gpio_flags(dn, earphone_detect_gpio_new, 0, NULL);
++	if (earphone_gpio_num < 0 && earphone_gpio_num_new < 0) {
+ 		snd_dbg("no earphone detect gpio\r\n");
+ 	}
+-	
++
++	/* RG35XX: method 3 polls both detect pins (one per board revision); either may be missing */
++	if (audio_hw_cfg.earphone_detect_method == 3 && (earphone_gpio_num > 0 || earphone_gpio_num_new > 0)) {
++		int err = gpio_request(earphone_gpio_num, "earphone_dect");
++		int err_new = gpio_request(earphone_gpio_num_new, "earphone_dect_new");
++
++		if (err && err_new) {
++			printk(KERN_ERR "gpio_request of earphone error: err=%d\n", err);
++			return err;
++		}
++		err = err ? err : gpio_direction_input(earphone_gpio_num);
++		err_new = err_new ? err_new : gpio_direction_input(earphone_gpio_num_new);
++		if (err && err_new) {
++			printk(KERN_ERR "gpio_direction_input of earphone error: err=%d\n", err);
++			gpio_free(earphone_gpio_num);
++			gpio_free(earphone_gpio_num_new);
++			earphone_gpio_num = -1;
++			earphone_gpio_num_new = -1;
++		}
++	}
++
+ 
+ 	return 0;
+ of_get_failed:
+@@ -2346,7 +2452,8 @@ static int __init atc2603c_init(void)
+ 		adc_detect_mode = 0;
+ 	}
+ 	
+-	if((audio_hw_cfg.earphone_detect_method == 1) || (audio_hw_cfg.earphone_detect_method == 2))
++	/* RG35XX: the codec owns h2w for every detect method but gpio (0), see asoc_earphone_poll() */
++	if (audio_hw_cfg.earphone_detect_method != 0)
+ 	{
+ 		headphone_sdev.name = "h2w";
+ 		ret = switch_dev_register(&headphone_sdev);
+@@ -2360,8 +2467,14 @@ static int __init atc2603c_init(void)
+     		{
+     			snd_err("failed to device_create_file\n");
+         	}
+-		
+-			
++
++
++	}
++
++	if (audio_hw_cfg.earphone_detect_method == 3 && (earphone_gpio_num > 0 || earphone_gpio_num_new > 0))
++	{
++		INIT_DELAYED_WORK(&dwork_poll, asoc_earphone_poll);
++		queue_delayed_work(system_wq, &dwork_poll, msecs_to_jiffies(500));
+ 	}
+ 
+ 	return 0;
+diff --git a/sound/soc/atc260x/link-owl.c b/sound/soc/atc260x/link-owl.c
+index e3136332..7b8d6e73 100755
+--- a/sound/soc/atc260x/link-owl.c
++++ b/sound/soc/atc260x/link-owl.c
+@@ -315,17 +315,8 @@ static struct snd_soc_dai_link atm7059_atc2603c_link_dai[] = {
+ 		.platform_name = "atm7059-pcm-audio",
+ 		.codec_name = "atm7059-hdmi-audio",
+ 		.ops = &atm7059_link_ops,
+-	},
+-		{
+-		.name = "ATM7059 SPDIF AUDIO",
+-		.stream_name = "SPDIF PCM",
+-		.cpu_dai_name = "owl-audio-i2s",//"gl5203-audio-i2s",
+-		.codec_dai_name = "atm7059-spdif-dai",
+-		.init = atm7059_link_snd_init,
+-		.platform_name = "atm7059-pcm-audio",
+-		.codec_name = "atm7059-spdif-audio",//"atm7059-spdif-audio",
+-		.ops = &atm7059_link_ops,
+ 	}
++	/* RG35XX: no SPDIF link (SND_SOC_SPDIF_OWL is off; the vendor kernel has a Bluetooth PCM link here) */
+ };
+ 
+ 
+@@ -430,14 +421,18 @@ static int i2s_switch_gpio_active;
+ 
+ 
+ 
+-static int __init atm7059_link_init(void)
++/**
++ * @brief Sets up the sound card (GPIOs, h2w, soc-audio device). RG35XX: runs from init_work, see
++ *        atm7059_link_init().
++ * @return 0 or a negative error.
++ */
++static int atm7059_link_setup(void)
+ {
+ 	int i = 0;
+ 	int ret = 0;
+ 	struct device_node *dn = NULL;
+ 	int pmu_type;
+ 
+-	snd_err("atm7059_link_init\n");
+ 
+ 
+ 	//20141013 yuchen: check pmu type to select correct codec param
+@@ -621,10 +616,34 @@ no_device_node:
+ 	return ret;
+ }
+ 
++/**
++ * @brief RG35XX: init_work handler, the card set-up once the codec and PMU drivers have probed.
++ * @param work init_work.
++ */
++static void init_work_handler(struct work_struct *work)
++{
++	atm7059_link_setup();
++}
++
++static DECLARE_WORK(init_work, init_work_handler);
++
++/**
++ * @brief Module init. RG35XX: like the running kernel, the card is set up from a work item instead of here.
++ * @return 0.
++ */
++static int __init atm7059_link_init(void)
++{
++	printk(KERN_INFO "atm7059_link_init\n");
++	schedule_work(&init_work);
++	return 0;
++}
++
+ static void __exit atm7059_link_exit(void)
+ {
+ 	int i = 0;
+ 
++	flush_work(&init_work);
++
+ 	for (i = 0; i < ARRAY_SIZE(link_attr); i++) {
+ 		device_remove_file(&atm7059_link_snd_device->dev, &link_attr[i]);
+ 	}
+-- 
+2.53.0
+

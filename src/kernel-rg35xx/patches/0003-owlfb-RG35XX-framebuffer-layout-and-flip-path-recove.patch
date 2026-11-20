@@ -1,0 +1,391 @@
+From 6d13d5341e53719ca993fc34e93f5b374940339f Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 18:56:08 +0100
+Subject: [PATCH 3/7] owlfb: RG35XX framebuffer layout and flip path recovered
+ from the vendor kernel
+
+Matches the running RG35XX kernel (function-level diff of its Image):
+- owlfb_info holds 2 overlays (OWLFB_MAX_OVL_PER_FB 2); owlfb_device gains
+  the DT "rotate" and "mode" values; DT values are read as u32 (the public
+  source passed u16 locals to of_property_read_u32), plus "bpp".
+- fb memory sized from the panel: fb0 = 5 double-buffered screens, other
+  fbs one; overlay reserve 512x512 YUV420; no 1920x1080 worst case.
+- yres_virtual defaults to two screens; DT mode 1 takes line_length from
+  xres; fb0 gets the DT rotation in var, overlays are set up unrotated.
+- pan_display always re-applies the new offset (the public source left a
+  dangling "if (...) //return 0;" guarding the var copy) and skips overlay 1
+  while userspace has no overlay disabled (overlay_disable_required, set by
+  the overlay enable/disable ioctl).
+- no blanket overlay manager apply at probe; no printk in set_par (called
+  on every GPU flip).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/owl/fb/owlfb-ioctl.c |   3 +
+ drivers/video/owl/fb/owlfb-main.c  | 100 +++++++++++++++--------------
+ drivers/video/owl/fb/owlfb-sysfs.c |   6 +-
+ drivers/video/owl/fb/owlfb.h       |  14 ++--
+ 4 files changed, 69 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/video/owl/fb/owlfb-ioctl.c b/drivers/video/owl/fb/owlfb-ioctl.c
+index c0588838..57ce3d7e 100755
+--- a/drivers/video/owl/fb/owlfb-ioctl.c
++++ b/drivers/video/owl/fb/owlfb-ioctl.c
+@@ -90,6 +90,9 @@ static int owlfb_set_overlay_enable(struct fb_info *fbi,int ovl_id ,bool enable)
+ 	struct owlfb_device *fbdev = ofbi->fbdev;
+ 	int rc = -1;
+ 	
++	/* RG35XX: remembered for owlfb_pan_display() */
++	overlay_disable_required = !enable;
++
+ 	if(ovl_id == OWLFB_CURSOR_OVL_ID)
+ 	{
+ 		struct owl_cursor_info cursor;
+diff --git a/drivers/video/owl/fb/owlfb-main.c b/drivers/video/owl/fb/owlfb-main.c
+index b303c14b..e7c5965e 100755
+--- a/drivers/video/owl/fb/owlfb-main.c
++++ b/drivers/video/owl/fb/owlfb-main.c
+@@ -48,6 +48,9 @@ module_param_named(test, owlfb_test_pattern, bool, 0644);
+ #endif
+ 
+ static int owlfb_fb_init(struct owlfb_device *fbdev, struct fb_info *fbi);
++
++/* RG35XX: see owlfb_set_overlay_enable(); pan_display re-applies overlay 1 only while this is set */
++int overlay_disable_required;
+ static int owlfb_get_recommended_bpp(struct owlfb_device *fbdev,
+ 		struct owl_dss_device *dssdev);
+ 
+@@ -338,7 +341,7 @@ static int check_fb_res_bounds(struct fb_var_screeninfo *var)
+ 		var->xres_virtual = var->xres;
+ 
+ 	if (var->yres_virtual == 0)
+-		var->yres_virtual = var->yres;
++		var->yres_virtual = var->yres * 2;	/* RG35XX: two pages, as in owlfb_fb_init() */
+ 
+ 	if (var->xres_virtual < xres_min || var->yres_virtual < yres_min)
+ 		return -EINVAL;
+@@ -443,8 +446,9 @@ void set_fb_fix(struct fb_info *fbi)
+ 
+ 	/* used by mmap in fbmem.c */
+ 	
++	/* RG35XX: DT mode 1 sizes the line from the visible width */
+ 	fix->line_length =
+-			(var->xres_virtual * var->bits_per_pixel) >> 3;
++			((ofbi->fbdev->mode ? var->xres : var->xres_virtual) * var->bits_per_pixel) >> 3;
+ 	fix->smem_len = rg->size;
+ 
+ 	fix->smem_start = owlfb_get_region_paddr(ofbi);
+@@ -611,7 +615,7 @@ int owlfb_setup_overlay(struct fb_info *fbi, struct owl_overlay *ovl,
+ 	struct owl_overlay_info info;
+ 	int xres, yres;
+ 
+-	int rotation = var->rotate;
++	int rotation = 0;	/* RG35XX: fb overlays are always set up unrotated, as in the running kernel */
+ 	int i;
+ 
+ 	WARN_ON(!atomic_read(&ofbi->region->lock_count));
+@@ -660,8 +664,14 @@ err:
+ 	return r;
+ }
+ 
+-/* apply var to the overlay */
+-int owlfb_apply_changes(struct fb_info *fbi, int init)
++/**
++ * @brief Applies var to the fb's overlays.
++ * @param fbi       The framebuffer.
++ * @param init      Called from probe: do not apply the managers.
++ * @param skip_ovl1 RG35XX: leave overlay 1 untouched (pan_display while no overlay is disabled by userspace).
++ * @return 0 or a negative error.
++ */
++int owlfb_apply_changes(struct fb_info *fbi, int init, int skip_ovl1)
+ {
+ 	int r = 0;
+ 	struct owlfb_info *ofbi = FB2OFB(fbi);
+@@ -689,6 +699,9 @@ int owlfb_apply_changes(struct fb_info *fbi, int init)
+ 	for (i = 0; i < ofbi->num_overlays; i++) {
+ 		ovl = ofbi->overlays[i];
+ 
++		if (skip_ovl1 && ovl->id == 1)
++			continue;
++
+ 		DBG("apply_changes, fb %d, ovl %d var->xres %d ,var->yres %d \n", ofbi->id, ovl->id,var->xres,var->yres);
+ 
+ 		if (ofbi->region->size == 0) {
+@@ -854,7 +867,7 @@ static int owlfb_set_par(struct fb_info *fbi)
+ 	struct owlfb_info *ofbi = FB2OFB(fbi);
+ 	int r;
+ 
+-	printk("set_par(%d)\n", FB2OFB(fbi)->id);
++	/* RG35XX: no printk here, userspace calls set_par on every GPU flip */
+ 	
+ 	owlfb_set_display_mode(fbi);
+ 
+@@ -862,7 +875,7 @@ static int owlfb_set_par(struct fb_info *fbi)
+ 
+ 	set_fb_fix(fbi);
+ 
+-	r = owlfb_apply_changes(fbi, 0);
++	r = owlfb_apply_changes(fbi, 0, 0);
+ 
+ 	owlfb_put_mem_region(ofbi->region);
+ 
+@@ -878,10 +891,7 @@ static int owlfb_pan_display(struct fb_var_screeninfo *var,
+ 
+ 	DBG("pan_display(%d) var->xoffset %x ,var->yoffset %x fbi->var.xoffset %x ,fbi->var.yoffset%x \n", FB2OFB(fbi)->id,var->xoffset,var->yoffset,fbi->var.xoffset,fbi->var.yoffset);
+ 
+-	if (var->xoffset == fbi->var.xoffset &&
+-	    var->yoffset == fbi->var.yoffset)
+-		//return 0;
+-
++	/* RG35XX: always re-apply, even at the same offset (the public source left a dangling if here) */
+ 	new_var = fbi->var;
+ 	new_var.xoffset = var->xoffset;
+ 	new_var.yoffset = var->yoffset;
+@@ -890,7 +900,7 @@ static int owlfb_pan_display(struct fb_var_screeninfo *var,
+ 
+ 	owlfb_get_mem_region(ofbi->region);
+ 
+-	r = owlfb_apply_changes(fbi, 0);
++	r = owlfb_apply_changes(fbi, 0, !overlay_disable_required);
+ 
+ 	owlfb_put_mem_region(ofbi->region);
+ 
+@@ -985,7 +995,7 @@ DBG("Apply overlay changes ofbi->num_overlays %d \n", ofbi->num_overlays);
+ 
+ 	    r = owlfb_overlay_enable(ovl, 1);		
+ 		
+-		r = owlfb_apply_changes(fbi, 0);
++		r = owlfb_apply_changes(fbi, 0, 0);
+  	}
+ #endif
+ 
+@@ -1249,9 +1259,15 @@ static int owlfb_alloc_fbmem(struct fb_info *fbi, unsigned long size)
+ 	return 0;
+ }
+ 
+-/* allocate fbmem using display resolution as reference */
+-static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned long size)
++/**
++ * @brief Allocates a framebuffer's memory, sized from its display.
++ * @param fbi     The framebuffer.
++ * @param screens RG35XX: number of double-buffered screens of the display's resolution.
++ * @return 0 (also without a display) or a negative error.
++ */
++static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned int screens)
+ {
++	unsigned long size;
+ 	struct owlfb_info *ofbi = FB2OFB(fbi);
+ 	struct owlfb_device *fbdev = ofbi->fbdev;
+ 	struct owl_dss_device *display;
+@@ -1274,12 +1290,12 @@ static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned long size)
+ 		break;
+ 	}
+ 
+-	if (!size) {
++	{
+ 		u16 w, h;
+ 
+ 		display->driver->get_resolution(display, &w, &h);
+ 
+-		size = w * h * bytespp * OWLFB_NUM_BUFFERS_PER_FB;
++		size = w * h * bytespp * OWLFB_NUM_BUFFERS_PER_FB * screens;
+ 
+ 	}
+ 
+@@ -1291,20 +1307,10 @@ static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned long size)
+ static int owlfb_allocate_all_fbs(struct owlfb_device *fbdev)
+ {
+ 	int i, r;
+-	unsigned long size = 0;
+ 
+ 	for (i = 0; i < fbdev->num_fbs; i++) {
+-		/* allocate memory automatically only for fb0, or if
+-		 * excplicitly defined with vram or plat data option */
+-		size = 0;
+-		if(i == 0){
+-			size = OWLFB_BUFFERS_MAX_XRES * OWLFB_BUFFERS_MAX_YRES * fbdev->bpp * OWLFB_NUM_BUFFERS_PER_FB;
+-#if CONFIG_FB_MAP_TO_DE	
+-			size += OWLFB_MAX_OVL_MEM_RESERVE_PER_OVL * OWLFB_MAX_OVL_MEM_RESERVE_NUM + OWLFB_MAX_CURSOR_MEM_RESERVE;		
+-#endif 
+-		}
+-		DBG("owlfb_allocate_all_fbs allocating %lu bytes for fb %d\n", size,i);
+-		r = owlfb_alloc_fbmem_display(fbdev->fbs[i],size);
++		/* RG35XX: sized from the panel instead of a 1920x1080 worst case */
++		r = owlfb_alloc_fbmem_display(fbdev->fbs[i], i == 0 ? OWLFB_FB0_SCREENS : 1);
+ 		if (r)
+ 			return r;		
+ 	}
+@@ -1380,7 +1386,7 @@ int owlfb_realloc_fbmem(struct fb_info *fbi, unsigned long size, int type)
+ 			DBG("owlfb_fb_init failed\n");
+ 			goto err;
+ 		}
+-		r = owlfb_apply_changes(fbi, 1);
++		r = owlfb_apply_changes(fbi, 1, 0);
+ 		if (r) {
+ 			DBG("owlfb_apply_changes failed\n");
+ 			goto err;
+@@ -1541,7 +1547,7 @@ static int owlfb_fb_init(struct owlfb_device *fbdev, struct fb_info *fbi)
+ 			var->xres = timings.x_res;
+ 			var->yres = timings.y_res;
+ 			var->xres_virtual = timings.x_res;
+-			var->yres_virtual = timings.y_res;
++			var->yres_virtual = timings.y_res * 2;	/* RG35XX: two pages to pan between */
+ 			var->xoffset = 0;
+ 			var->yoffset = 0;
+ 			var->pixclock = KHZ2PICOS(timings.pixel_clock);
+@@ -1555,11 +1561,15 @@ static int owlfb_fb_init(struct owlfb_device *fbdev, struct fb_info *fbi)
+ 			var->xres = fbdev->xres;
+ 			var->yres = fbdev->yres;
+ 			var->xres_virtual = var->xres;
+-			var->yres_virtual = var->yres;
++			var->yres_virtual = var->yres * 2;	/* RG35XX: two pages to pan between */
+ 			var->bits_per_pixel = fbdev->bpp * 8;	
+ 		}	
+ 	}	
+ 	
++	/* RG35XX: DT rotation for the primary fb */
++	if (fbdev->fbs[0] == fbi)
++		var->rotate = fbdev->rotate;
++
+ 	r = check_fb_var(fbi, var);
+ 	
+ 	if (r)
+@@ -1609,7 +1619,7 @@ static void owlfb_hotplug_notify(struct owl_dss_device *dssdev, int state)
+ 			}	
+ 		
+ 			owlfb_get_mem_region(FB2OFB(external_mgr->link_fbi)->region);
+-			owlfb_apply_changes(external_mgr->link_fbi, 0);
++			owlfb_apply_changes(external_mgr->link_fbi, 0, 0);
+ 			owlfb_put_mem_region(FB2OFB(external_mgr->link_fbi)->region);	
+ 	}
+ #endif
+@@ -1815,7 +1825,7 @@ static int owlfb_create_framebuffers(struct owlfb_device *fbdev)
+ 		struct owlfb_info *ofbi = FB2OFB(fbi);
+ 
+ 		owlfb_get_mem_region(ofbi->region);
+-		r = owlfb_apply_changes(fbi, 1);
++		r = owlfb_apply_changes(fbi, 1, 0);
+ 		owlfb_put_mem_region(ofbi->region);
+ 
+ 		if (r) {
+@@ -1996,7 +2006,7 @@ static int owlfb_parse_params(struct platform_device *pdev,struct owlfb_device *
+ 	struct device_node      *of_node;
+     char                    propname[20];
+     char * def_display_name = &propname[0];
+-    u16 xres , yres , bpp;
++    u32 xres, yres, bpp, rotate, mode;	/* RG35XX: u32, of_property_read_u32 writes 4 bytes */
+     int i ;
+     
+     of_node = pdev->dev.of_node;
+@@ -2040,9 +2050,13 @@ static int owlfb_parse_params(struct platform_device *pdev,struct owlfb_device *
+     	{
+     		fbdev->refresh = 60;
+     	}    	
+-    } 
+-    fbdev->bpp = 4;       
+-	printk("fbdev info : xres %d yres %d refresh %d name %s \n",fbdev->xres,fbdev->yres,fbdev->refresh,fbdev->def_display->name);
++    }
++	/* RG35XX: bpp, rotate and mode from the DT */
++	fbdev->bpp = of_property_read_u32(of_node, "bpp", &bpp) ? 4 : bpp;
++	fbdev->rotate = !of_property_read_u32(of_node, "rotate", &rotate) && rotate <= 3 ? rotate : 0;
++	fbdev->mode = !of_property_read_u32(of_node, "mode", &mode) && mode <= 1 ? mode : 0;
++	pr_info("fbdev info: xres %d, yres %d, rotate %d, refresh %d, mode %d def_display %s\n", fbdev->xres,
++		fbdev->yres, fbdev->rotate, fbdev->refresh, fbdev->mode, fbdev->def_display->name);
+ }
+ static struct of_device_id owl_fb_of_match[] = {
+ 	{
+@@ -2135,15 +2149,7 @@ static int owlfb_probe(struct platform_device *pdev)
+ 			}
+ 	}
+ 
+-#ifdef CONFIG_FB_MAP_TO_DE
+-	for (i = 0; i < fbdev->num_managers; i++) {
+-		struct owl_overlay_manager *mgr;
+-		mgr = fbdev->managers[i];
+-		r = mgr->apply(mgr);
+-		if (r)
+-			dev_warn(fbdev->dev, "failed to apply dispc config\n");
+-	}
+-#endif
++	/* RG35XX: no blanket apply of every overlay manager at probe, as in the running kernel */
+ 
+ 	DBG("create sysfs for fbs\n");
+ 	r = owlfb_create_sysfs(fbdev);
+diff --git a/drivers/video/owl/fb/owlfb-sysfs.c b/drivers/video/owl/fb/owlfb-sysfs.c
+index e28f51d4..193a52bf 100755
+--- a/drivers/video/owl/fb/owlfb-sysfs.c
++++ b/drivers/video/owl/fb/owlfb-sysfs.c
+@@ -113,7 +113,7 @@ static ssize_t store_mirror_to_hdmi(struct device *dev,
+     	external_mgr->link_fbi	= NULL;
+     }   
+     
+-	r = owlfb_apply_changes(fbi, 0);
++	r = owlfb_apply_changes(fbi, 0, 0);
+ 	if (r)
+ 		goto out;
+ 
+@@ -302,7 +302,7 @@ static ssize_t store_overlays(struct device *dev, struct device_attribute *attr,
+ 	if (added) {
+ 		owlfb_get_mem_region(ofbi->region);
+ 
+-		r = owlfb_apply_changes(fbi, 0);
++		r = owlfb_apply_changes(fbi, 0, 0);
+ 
+ 		owlfb_put_mem_region(ofbi->region);
+ 
+@@ -362,7 +362,7 @@ static ssize_t store_overscan(struct device *dev,
+ 	
+ 	owlfb_get_mem_region(ofbi->region);
+ 	
+-	owlfb_apply_changes(fbi, 0);
++	owlfb_apply_changes(fbi, 0, 0);
+ 	
+ 	owlfb_put_mem_region(ofbi->region);
+ out:
+diff --git a/drivers/video/owl/fb/owlfb.h b/drivers/video/owl/fb/owlfb.h
+index 2de3755d..698e73fb 100755
+--- a/drivers/video/owl/fb/owlfb.h
++++ b/drivers/video/owl/fb/owlfb.h
+@@ -48,13 +48,15 @@ extern bool owlfb_debug;
+ 
+ /* max number of overlays to which a framebuffer data can be direct */
+ #define OWLFB_NUM_FBS        2
+-#define OWLFB_MAX_OVL_PER_FB 3
++#define OWLFB_MAX_OVL_PER_FB 2	/* RG35XX: fb0 drives overlays 0 and 1 */
+ #define OWLFB_NUM_BUFFERS_PER_FB 2
++/* RG35XX: fb0 memory, in double-buffered screens: pages for userspace, then the overlay and cursor reserve */
++#define OWLFB_FB0_SCREENS 5
+ 
+ #define OWLFB_BUFFERS_MAX_XRES 1920
+ #define OWLFB_BUFFERS_MAX_YRES 1080
+ 
+-#define OWLFB_MAX_OVL_MEM_RESERVE_PER_OVL  (2048 * 2048 * 3 / 2)
++#define OWLFB_MAX_OVL_MEM_RESERVE_PER_OVL  (512 * 512 * 3 / 2)	/* RG35XX: one 512x512 YUV420 plane */
+ #define OWLFB_MAX_OVL_MEM_RESERVE_NUM  1
+ #define OWLFB_MAX_CURSOR_MEM_RESERVE  (64 * 64 * 4)
+ #define OWLFB_CURSOR_OVL_ID 3
+@@ -123,7 +125,8 @@ struct owlfb_device {
+ 	int yres;
+ 	int bpp;
+ 	int refresh;
+-	
++	int rotate;	/* RG35XX: DT "rotate" (0..3), applied to fb0's var */
++	int mode;	/* RG35XX: DT "mode"; 1 = line_length from xres, not xres_virtual */
+ };
+ 
+ struct owlfb_colormode {
+@@ -139,7 +142,10 @@ struct owlfb_colormode {
+ void set_fb_fix(struct fb_info *fbi);
+ int check_fb_var(struct fb_info *fbi, struct fb_var_screeninfo *var);
+ int owlfb_realloc_fbmem(struct fb_info *fbi, unsigned long size, int type);
+-int owlfb_apply_changes(struct fb_info *fbi, int init);
++int owlfb_apply_changes(struct fb_info *fbi, int init, int skip_ovl1);
++
++/* RG35XX: set while userspace has an overlay disabled through OWLFB_OVERLAY_DISABLE */
++extern int overlay_disable_required;
+ 
+ int owlfb_create_sysfs(struct owlfb_device *fbdev);
+ void owlfb_remove_sysfs(struct owlfb_device *fbdev);
+-- 
+2.53.0
+

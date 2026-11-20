@@ -1,0 +1,791 @@
+From 5a292c2273cce1f057d4cb89552a9fbb6857f203 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 17:55:29 +0100
+Subject: [PATCH 2/7] atc260x_power: RG35XX board support recovered from the
+ vendor kernel
+
+Recovered from the RG35XX running kernel (3.10.37 ctalon #40, binary only)
+by function-level comparison; the charger struct layout matches the device.
+
+- Rumble motor on the PWM of the absent external DC-DC (DT pwms "ext_moto",
+  ext_dcdc_exist = 0): sysfs "moto", 0..100 % duty, started stopped.
+- Status LEDs: work and low-battery LED pairs, a second charge-LED pin
+  ("_new" DT properties: the board revisions use one pin or the other),
+  driven by a 500 ms poll on system_wq (allen_led_poll) that the first
+  charging-monitor run starts; it replaces led_state_charge/normal. sysfs
+  "led_test" blinks every LED (factory test).
+- USB OTG: ID input, switch and VBUS-enable outputs; the poll powers the
+  port while the ID pin reads high.
+- ldo5 rail enabled at probe.
+- no_screen (DT): there is no owl backlight to ask, so the charge current
+  uses the screen-on limits (screen-off ones in charger boot mode).
+- Battery temperature control (DT temp_ctl_enable, off in the RG35XX DTS):
+  protective power-off via owl_force_shutdown(), charging stopped outside a
+  window and resumed with hysteresis.
+- Charger status changes are logged.
+
+Deliberate differences from the vendor binary: the repeated GPIO blocks use
+two helpers, absent or busy pins are skipped instead of driven, and
+shutdown also stops the LED poll before freeing its GPIOs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/atc260x_power/atc260x_power.h   |  14 +-
+ .../power/atc260x_power/atc260x_power_main.c  | 498 +++++++++++++++---
+ 2 files changed, 440 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/power/atc260x_power/atc260x_power.h b/drivers/power/atc260x_power/atc260x_power.h
+index f073e8d5..efacd07f 100755
+--- a/drivers/power/atc260x_power/atc260x_power.h
++++ b/drivers/power/atc260x_power/atc260x_power.h
+@@ -95,6 +95,7 @@ struct atc260x_cfg_items {
+ 	unsigned int usb_adapter_as_ac;
+ 	int boot_cap_threshold;
+ 	int bl_on_voltage;
++	int no_screen;	/* RG35XX: no owl backlight to ask; charge with the screen-on limits (screen-off ones in charger mode) */
+ 	
+ 	//struct gpio_pre_cfg charger_led_cfg;
+ 	//struct gpio_pre_cfg ext_chg_ctrl_cfg;
+@@ -103,11 +104,20 @@ struct atc260x_cfg_items {
+ 	int ot_shutoff_enable;
+ 
+ 	int gpio_led_inner_pin;
++	int gpio_led_inner_pin_new;	/* RG35XX: charge LED pin of newer board revisions, driven with the first */
+ 	int gpio_led_active_low;
+ 	bool charger_led_exist;
+ 	int gpio_ext_chg_ctrl_pin;
+ 	int gpio_ext_chg_ctrl_active_low;
+ 	bool ext_charger_exist;
++
++	/* RG35XX battery temperature control, degrees C (off in the RG35XX DTS); see check_battery_temperature() */
++	bool temp_ctl_enable;
++	int temp_shutdown_low;
++	int temp_stop_low;
++	int temp_shutdown_high;
++	int temp_stop_high;
++	int temp_diff_restart;
+ };
+ 
+ struct atc260x_charger {
+@@ -136,7 +146,8 @@ struct atc260x_charger {
+ 	struct completion check_complete;
+ 
+ 	/* battery status */
+-	bool bat_is_exist;	
++	bool bat_is_exist;
++	bool temp_discharging;	/* RG35XX: charging stopped by the temperature control */
+ 	int chg_type;
+ 	int bat_mv;
+ 	int bat_ma;
+@@ -210,6 +221,7 @@ struct atc260x_charger {
+ 	void (*dump_regs)(struct atc260x_charger *charger);
+ 
+ 	struct dentry *debug_file;
++	struct delayed_work led_work;	/* RG35XX: 500 ms poll of the status LEDs and the OTG switch */
+ };
+ 
+ struct atc260x_battery
+diff --git a/drivers/power/atc260x_power/atc260x_power_main.c b/drivers/power/atc260x_power/atc260x_power_main.c
+index 26b33c87..a8670a11 100755
+--- a/drivers/power/atc260x_power/atc260x_power_main.c
++++ b/drivers/power/atc260x_power/atc260x_power_main.c
+@@ -32,6 +32,9 @@
+ #include <linux/mutex.h>
+ #include <linux/mfd/atc260x/atc260x.h>
+ #include <mach/bootdev.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reboot.h>
++#include <mach/power.h>
+ #include "atc260x_power.h"
+ 
+ #define GPIO_NAME_LED_INNER_CHARGER "inner_charger_led_ctl"
+@@ -729,25 +732,153 @@ void atc260x_charger_turn_off_force(void)
+ EXPORT_SYMBOL_GPL(atc260x_charger_turn_off_force);
+ 
+ 
+-static void led_state_charge(struct atc260x_charger *charger){
++/*
++ * RG35XX board support, recovered from the vendor kernel the console ships with (3.10.37 ctalon #40): status LEDs
++ * (work, low battery and charge, each on two pins: the board revisions use one or the other), the USB OTG power
++ * switch, the ldo5 rail and the rumble motor on the PWM of the absent external DC-DC. The LEDs and the OTG switch
++ * are driven by a 500 ms poll on system_wq, started by the first charging-monitor run. The pin values are the
++ * vendor's raw ones: each "level" is bit 0 of the DT GPIO flags.
++ */
++static int led_test_flg;		/* sysfs led_test: blink every LED once a second (factory test) */
++static struct pwm_device *moto_pwm;	/* rumble motor, sysfs moto */
++static int led_test_counter;
++static struct regulator *ldo5_reg;
++static int work_led_pin = -1, work_led_pin_new = -1, work_led_level;
++static int low_led_pin = -1, low_led_pin_new = -1, low_led_level;
++static int otg_id_pin = -1, otg_1_pin = -1, otg_2_pin = -1;
++static int otg_state;			/* 1 while the OTG ID pin reads high */
++static int my_led_status;		/* 0 on battery, 1 external power, 2 low battery */
++static bool led_poll_started;
+ 
+-    if(charger->led_status)
+-        return ;
+-    if (charger->cfg_items.charger_led_exist) {
+-		gpio_direction_output(charger->cfg_items.gpio_led_inner_pin, !(charger->cfg_items.gpio_led_active_low));
+-    }
+-    charger->led_status=1;
++/**
++ * @brief Sets a board GPIO that may be absent.
++ * @param pin   GPIO number, < 0 when absent.
++ * @param value Pin value.
++ */
++static void board_gpio_set(int pin, int value)
++{
++	if (pin >= 0)
++		gpio_set_value(pin, value);
+ }
+-static void led_state_normal(struct atc260x_charger *charger){
+-	if(!charger->led_status)
+-		return ;   
+-	
+-	if (charger->cfg_items.charger_led_exist) 
+-	{
+-		gpio_direction_output(charger->cfg_items.gpio_led_inner_pin, charger->cfg_items.gpio_led_active_low);
+-	}    
+ 
+-	charger->led_status=0;
++/**
++ * @brief Requests a board GPIO and sets its direction.
++ * @param pin   GPIO number from the DT, < 0 when absent.
++ * @param label gpio_request label.
++ * @param value Initial output value, or -1 for an input.
++ * @return The GPIO number, or -1 when absent or already taken.
++ */
++static int board_gpio_claim(int pin, const char *label, int value)
++{
++	if (pin < 0)
++		return -1;
++	if (gpio_request(pin, label) < 0) {
++		power_err("[ATC260X] %s =%d request failed!\n", label, pin);
++		return -1;
++	}
++	if (value < 0)
++		gpio_direction_input(pin);
++	else
++		gpio_direction_output(pin, value);
++	return pin;
++}
++
++/**
++ * @brief Charge LED: lit while the wall supply is up (> 3.6 V) and the battery is below 100%.
++ * @param charger The charger; its led_status remembers the lit state.
++ */
++static void set_my_charg_led(struct atc260x_charger *charger)
++{
++	int active_low = charger->cfg_items.gpio_led_active_low;
++	int on = charger->wall_mv > 3600 && charger->cur_bat_cap <= 99;
++
++	if (on == charger->led_status)
++		return;
++	charger->led_status = on;
++	if (charger->cfg_items.charger_led_exist) {
++		board_gpio_set(charger->cfg_items.gpio_led_inner_pin, on ? active_low : !active_low);
++		board_gpio_set(charger->cfg_items.gpio_led_inner_pin_new, on ? active_low : !active_low);
++	}
++}
++
++/**
++ * @brief Sets the work and low-battery LED pairs.
++ * @param work Value of both work LED pins.
++ * @param low  Value of both low-battery LED pins.
++ */
++static void set_my_work_led(int work, int low)
++{
++	board_gpio_set(work_led_pin, work);
++	board_gpio_set(work_led_pin_new, work);
++	board_gpio_set(low_led_pin, low);
++	board_gpio_set(low_led_pin_new, low);
++}
++
++/**
++ * @brief The 500 ms board poll: OTG power switch from the ID pin, then the LEDs (factory blink test, charger boot
++ *        mode, external power, low battery at 1..11% or at 0% with <= 3499 mV, else normal). Requeues itself.
++ * @param work charger->led_work.
++ */
++static void allen_led_poll(struct work_struct *work)
++{
++	struct atc260x_charger *charger = container_of(to_delayed_work(work), struct atc260x_charger, led_work);
++	int active_low = charger->cfg_items.gpio_led_active_low;
++
++	if (otg_id_pin >= 0) {
++		int id = gpio_get_value(otg_id_pin);
++
++		if (!id && otg_state == 1) {
++			printk(KERN_ERR "--allen--<%s> otg out \n", "set_my_vbus_switch");
++			otg_state = 0;
++			board_gpio_set(otg_2_pin, 0);
++		} else if (id && otg_state == 0) {
++			printk(KERN_ERR "--allen--<%s> otg insert \n", "set_my_vbus_switch");
++			otg_state = 1;
++			board_gpio_set(otg_2_pin, 1);
++		}
++	}
++
++	if (led_test_flg == 1) {
++		if (++led_test_counter == 2) {
++			set_my_work_led(work_led_level, low_led_level);
++			if (charger->cfg_items.charger_led_exist) {
++				board_gpio_set(charger->cfg_items.gpio_led_inner_pin, active_low);
++				board_gpio_set(charger->cfg_items.gpio_led_inner_pin_new, active_low);
++			}
++		} else if (led_test_counter == 4) {
++			led_test_counter = 0;
++			set_my_work_led(!work_led_level, !low_led_level);
++			if (charger->cfg_items.charger_led_exist) {
++				board_gpio_set(charger->cfg_items.gpio_led_inner_pin, !active_low);
++				board_gpio_set(charger->cfg_items.gpio_led_inner_pin_new, !active_low);
++			}
++		}
++	} else if (charger->bat_is_exist) {
++		if (owl_get_boot_mode() != OWL_BOOT_MODE_CHARGER) {
++			int cap = charger->cur_bat_cap;
++
++			if (charger->charge_on || charger->wall_mv > 3600) {
++				if (my_led_status != 1) {
++					printk("--allen--<%s> 11111 my_led_status=%d \n", "set_my_work_led", my_led_status);
++					my_led_status = 1;
++					set_my_work_led(work_led_level, !low_led_level);
++				}
++			} else if ((cap >= 1 && cap <= 11) || (cap == 0 && charger->bat_mv <= 3499)) {
++				if (my_led_status != 2) {
++					printk("--allen--<%s> 22222,cur_bat_cap=%d,bat_mv=%d \n", "set_my_work_led",
++					       cap, charger->bat_mv);
++					my_led_status = 2;
++					set_my_work_led(!work_led_level, low_led_level);
++				}
++			} else if (my_led_status != 0) {
++				printk("--allen--<%s> 00000,my_led_status=%d \n", "set_my_work_led", my_led_status);
++				my_led_status = 0;
++				set_my_work_led(work_led_level, !low_led_level);
++			}
++		}
++		set_my_charg_led(charger);
++	}
++	queue_delayed_work(system_wq, &charger->led_work, msecs_to_jiffies(500));
+ }
+ 
+ #define PWM_LEVEL_CHANGE_STEP    5
+@@ -987,12 +1118,12 @@ static void atc260x_check_bat_online(struct atc260x_charger *charger)
+ 		ret = charger->check_bat_online(charger->atc260x);
+ 		if (ret <= 0) 
+ 		{
+-			pr_warn("\n[power] No battery detected\n");//add by bill
++			pr_warn("\n[power] No battery detected\n");//add by bill
+ 			charger->bat_is_exist = false;
+ 		} 
+ 		else 
+ 		{
+-			pr_info("\n[power] Battery detected\n");//add by bill
++			pr_info("\n[power] Battery detected\n");//add by bill
+ 			charger->bat_is_exist = true;
+ 		}
+ 		batv_after_check = get_batv_avr(charger);
+@@ -1092,16 +1223,61 @@ static void update_charge_state( struct atc260x_charger *charger)
+ 	/*vbus/wall voltage*/ 
+ 	atc260x_update_voltage(charger);
+ 
+-	if (owl_backlight_is_on()) 
++	/* RG35XX (no_screen): charge with the screen-on limits, the screen-off ones in charger boot mode */
++	if (charger->cfg_items.no_screen)
++	{
++		charger->cur_bl_status = owl_get_boot_mode() == OWL_BOOT_MODE_CHARGER ? BL_OFF : BL_ON;
++	}
++	else if (owl_backlight_is_on())
+ 	{
+ 		charger->cur_bl_status = BL_ON;
+-	} 
+-	else 
++	}
++	else
+ 	{
+ 		charger->cur_bl_status = BL_OFF;
+ 	}
+ 
+ 	update_adapter_type(charger);
++
++	if (charger->charger_cur_status != charger->charger_pre_status)
++		power_info("%s:power  status change, cur=0x%x, pre=0x%x\n", __func__,
++			   charger->charger_cur_status, charger->charger_pre_status);
++}
++
++/**
++ * @brief RG35XX battery temperature control (cfg temp_ctl_enable): powers off, without charger wake-up, outside
++ *        [temp_shutdown_low, temp_shutdown_high]; stops charging outside [temp_stop_low, temp_stop_high] and allows
++ *        it again once temp_diff_restart degrees back inside. Readings below -100 C are ignored.
++ * @param charger The charger.
++ */
++static void check_battery_temperature(struct atc260x_charger *charger)
++{
++	struct atc260x_cfg_items *cfg = &charger->cfg_items;
++	int t = charger->bat_temp;
++
++	if (!charger->bat_is_exist || !cfg->temp_ctl_enable || t < -100)
++		return;
++	power_info("bat temp %d(C)\n", t);
++	if (t > cfg->temp_shutdown_high || t < cfg->temp_shutdown_low)
++	{
++		pr_err("bat temp reached %d(C), shutting down \n", t);
++		owl_force_shutdown();
++		orderly_poweroff(true);
++	}
++	else if (!charger->temp_discharging)
++	{
++		if (t > cfg->temp_stop_high || t < cfg->temp_stop_low)
++		{
++			pr_warn("bat temp =%d C  > %d , < %d, dischargeing\n", t, cfg->temp_stop_high, cfg->temp_stop_low);
++			charger->temp_discharging = true;
++		}
++	}
++	else if (t > cfg->temp_stop_low + cfg->temp_diff_restart && t < cfg->temp_stop_high - cfg->temp_diff_restart)
++	{
++		pr_warn("bat temp =%d C between [%d , %d], rechargeing\n", t,
++			cfg->temp_stop_low + cfg->temp_diff_restart, cfg->temp_stop_high - cfg->temp_diff_restart);
++		charger->temp_discharging = false;
++	}
+      
+ }
+ 
+@@ -1143,7 +1319,6 @@ static void turn_off_charger_if_needed(struct atc260x_charger *charger)
+ 		/* disable charger if battery is removed */
+ 		if (charger->charge_on) 
+ 		{
+-			led_state_normal(charger);
+ 			atc260x_charger_turn_off();
+ 			power_info("%s:battery doesn't exist,charger turn off\n", __func__);
+ 			charger_once_on = false;
+@@ -1152,10 +1327,17 @@ static void turn_off_charger_if_needed(struct atc260x_charger *charger)
+ 		return;
+ 	}
+ 
++	/* RG35XX: battery outside the temperature window */
++	if (charger->temp_discharging && charger->charge_on)
++	{
++		atc260x_charger_turn_off();
++		power_info("%s:bat temp err, charger turn off\n", __func__);
++		charger_once_on = false;
++	}
++
+ 	/*charger hotplug*/
+ 	if(!charger->extern_power_online && charger->charge_on)
+ 	{
+-		led_state_normal(charger);
+ 		atc260x_charger_turn_off();
+ 		power_info("%s:hotplug-out, charger turn off\n", __func__);
+ 		charger_once_on = false;
+@@ -1165,14 +1347,12 @@ static void turn_off_charger_if_needed(struct atc260x_charger *charger)
+ 	// ywwang  todo
+ 	if (charger->extern_power_online && (charger->cur_bat_cap < 100)) 
+ 	{
+-		if(charger->charge_on) //add by bill
+-			led_state_charge(charger);
++		/* RG35XX: the charge LED is driven by allen_led_poll() */
+ 	} 
+ 	else 
+ 	{
+ 		if(charger->charge_on)
+ 		{
+-			led_state_normal(charger);
+ 			atc260x_charger_turn_off();
+ 			power_info("%s:power full,charger turn off\n", __func__);
+ 			charger_once_on = false;
+@@ -1207,7 +1387,8 @@ static void turn_on_charger_if_needed(struct atc260x_charger *charger)
+ 		return;
+ 	}
+ 
+-	if(!charger->bat_is_exist || 
++	if(!charger->bat_is_exist ||
++		charger->temp_discharging ||
+ 		charger->charge_on ||
+ 		!charger->extern_power_online || 
+ 		charger->cur_bat_cap == 100 ||
+@@ -1219,14 +1400,13 @@ static void turn_on_charger_if_needed(struct atc260x_charger *charger)
+ 
+ 	WARN_ON(charger_delay_counter > 7);
+ 	charger_delay_counter++;
+-	if (!charger->charge_on && charger_delay_counter == 2) //add by bill
++	if (!charger->charge_on && charger_delay_counter == 2) //add by bill
+ 	{
+ 		atc260x_charger_turn_on();
+ 		if(charger->charge_on)
+ 		{
+ 			power_info("%s:charger turn on\n", __func__);
+ 			charger_once_on = true;
+-			led_state_charge(charger);
+ 		}
+ 
+ 		charger_delay_counter = -1;
+@@ -1519,6 +1699,7 @@ static void atc260x_charging_monitor(struct work_struct *work)
+ 	/* step 1 : check if any charge cable is connected*/
+ 	update_battery_state(charger);
+ 	update_charge_state(charger);
++	check_battery_temperature(charger);
+ 	
+ 	atc260x_disable_vbus_id_if_needed(charger);
+ 
+@@ -1558,6 +1739,12 @@ static void atc260x_charging_monitor(struct work_struct *work)
+ 
+ 	/* reschedule for the next time */
+ 	queue_delayed_work(charger->charger_wq, &charger->work, msecs_to_jiffies(charger->interval * 1000));
++
++	/* RG35XX: the LED / OTG poll starts once the battery state is known */
++	if (!led_poll_started) {
++		led_poll_started = true;
++		queue_delayed_work(system_wq, &charger->led_work, 0);
++	}
+ }
+ 
+ static int atc260x_bat_check_status(struct atc260x_charger *charger, int *status)
+@@ -2224,11 +2411,67 @@ static ssize_t store_bl_on_voltage(struct device *dev, struct device_attribute *
+ 	
+ }
+ 
++/**
++ * @brief sysfs read of led_test: logs the flag (the vendor kernel prints nothing back).
++ * @return 0 (empty read).
++ */
++static ssize_t show_led_test(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	printk(KERN_ERR "led_test_flg= %d\n", led_test_flg);
++	return 0;
++}
++
++/**
++ * @brief sysfs write of led_test: non-zero makes the LED poll blink every LED, 0 returns to the status LEDs.
++ * @return count.
++ */
++static ssize_t store_led_test(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	led_test_flg = simple_strtoul(buf, NULL, 10) != 0;
++	led_test_counter = 0;
++	return count;
++}
++
++/**
++ * @brief sysfs read of the rumble motor: logs the PWM period (the vendor kernel prints nothing back).
++ * @return 0 (empty read).
++ */
++static ssize_t show_moto(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	if (!moto_pwm)
++		return 0;
++	printk("PWM:priod_ns= %d\n", moto_pwm->period);
++	return 0;
++}
++
++/**
++ * store_moto - sysfs write of the rumble motor strength, 0..100 (larger values are clamped). 0 stops the motor
++ * (duty of 1 ns); n sets the duty to n% of the PWM period.
++ */
++static ssize_t store_moto(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	unsigned long level = simple_strtoul(buf, NULL, 10);
++
++	pr_err("%s: set moto pwm (%ld) \n", __func__, level);
++	if (!moto_pwm)
++		return count;
++	if (level == 0) {
++		pwm_config(moto_pwm, 1, moto_pwm->period);
++		return count;
++	}
++	if (level > 100)
++		level = 100;
++	pwm_config(moto_pwm, moto_pwm->period * level / 100, moto_pwm->period);
++	return count;
++}
++
+ static struct device_attribute atc260x_power_attrs[] = {
+ 	__ATTR(boot_cap_threshold, S_IRUGO | S_IWUSR, show_boot_cap_threshold, store_boot_cap_threshold),
+ 	__ATTR(dump, S_IRUGO | S_IWUSR, show_dump, store_dump),
+ 	 __ATTR(charger_online, S_IRUGO | S_IWUSR, show_charger_online, store_charger_online),
+ 	__ATTR(bl_on_voltage, S_IRUGO | S_IWUSR, show_bl_on_voltage, store_bl_on_voltage),
++	__ATTR(led_test, S_IRUGO | S_IWUSR, show_led_test, store_led_test),
++	__ATTR(moto, S_IRUGO | S_IWUSR, show_moto, store_moto),
+ };
+ 
+ int atc260x_power_create_sysfs(struct atc260x_charger *charger)
+@@ -2258,6 +2501,28 @@ void atc260x_power_remove_sysfs(struct atc260x_charger *charger)
+ 	}
+ }
+ 
++/**
++ * @brief Reads one temperature item of the RG35XX battery temperature control from the power DT node.
++ * @param charger The charger (its DT node).
++ * @param name    DT property.
++ * @param def     Value when the property is absent.
++ * @return Degrees C; DT values above 1000 encode negatives (1000 - value).
++ */
++static int atc260x_get_temp_item(struct atc260x_charger *charger, const char *name, int def)
++{
++	int len;
++	const __be32 *property = of_get_property(charger->node, name, &len);
++	int value;
++
++	if (!property || len != sizeof(int))
++		return def;
++	value = be32_to_cpup(property);
++	if (value > 1000)
++		value = 1000 - value;
++	power_info("%s: %d \n", name, value);
++	return value;
++}
++
+ static int atc260x_get_cfg_item(struct atc260x_charger *charger)
+ {
+ 	const __be32 *property;
+@@ -2292,6 +2557,30 @@ static int atc260x_get_cfg_item(struct atc260x_charger *charger)
+ 	    cur_ratio = PMU_VERSION_ABC_CC_RATIO;
+ 	}
+ 	/*end here */
++
++	/* RG35XX: battery temperature control; DT values above 1000 encode negatives (1005 = -5 C) */
++	property = of_get_property(charger->node, "temp_ctl_enable", &len);
++	if (property && len == sizeof(int))
++	{
++		charger->cfg_items.temp_ctl_enable = be32_to_cpup(property) != 0;
++		power_info("temp_ctl_enable: %d \n", charger->cfg_items.temp_ctl_enable);
++	}
++	else
++	{
++		charger->cfg_items.temp_ctl_enable = false;
++	}
++	if (charger->cfg_items.temp_ctl_enable)
++	{
++		charger->cfg_items.temp_shutdown_low = atc260x_get_temp_item(charger, "temp_shutdown_low", -5);
++		charger->cfg_items.temp_stop_low = atc260x_get_temp_item(charger, "temp_stop_low", 0);
++		charger->cfg_items.temp_shutdown_high = atc260x_get_temp_item(charger, "temp_shutdown_high", 50);
++		charger->cfg_items.temp_stop_high = atc260x_get_temp_item(charger, "temp_stop_high", 45);
++		charger->cfg_items.temp_diff_restart = atc260x_get_temp_item(charger, "temp_diff_restart", 2);
++	}
++	else
++	{
++		power_info("temp_ctl_enable is not  enable\n");
++	}
+ 	
+ 	// step 1: get max charger current from dts
+ 	property = of_get_property(charger->node, "bl_on_usb_pc_max_charge_current", &len);
+@@ -2465,6 +2754,18 @@ static int atc260x_get_cfg_item(struct atc260x_charger *charger)
+ 		charger->cfg_items.enable_vbus_current_limited = 1;
+ 	}
+ 	
++	/* RG35XX: no owl backlight on this board, see update_charge_state() */
++	property = of_get_property(charger->node, "no_screen", &len);
++	if (property && len == sizeof(int))
++	{
++		charger->cfg_items.no_screen = be32_to_cpup(property);
++		printk("no_screen: %d \n", charger->cfg_items.no_screen);
++	}
++	else
++	{
++		charger->cfg_items.no_screen = 0;
++	}
++
+ 	property = of_get_property(charger->node, "usb_adapter_as_ac", &len);
+ 	if (property && len == sizeof(int))
+ 	{
+@@ -2525,21 +2826,46 @@ static int atc260x_get_cfg_item(struct atc260x_charger *charger)
+ 	power_dbg("[power]ot_shutoff_enable: %d\n", charger->cfg_items.ot_shutoff_enable);
+ 
+ 	/*get gpio config for charge led*/
++	/* RG35XX: two charge-LED pins (board revisions), both start off; the polarity is the last lookup's */
+ 	charger->cfg_items.gpio_led_inner_pin = of_get_named_gpio_flags(charger->node, GPIO_NAME_LED_INNER_CHARGER, 0, &flags);
+-	if (charger->cfg_items.gpio_led_inner_pin >= 0)
+-	{
+-		charger->cfg_items.gpio_led_active_low = flags & OF_GPIO_ACTIVE_LOW;
+-		if (gpio_request(charger->cfg_items.gpio_led_inner_pin, GPIO_NAME_LED_INNER_CHARGER) < 0) 
+-		{
+-			power_err("[ATC260X] gpio_led_inner_pin =%d request failed!\n", charger->cfg_items.gpio_led_inner_pin);
+-		}
+-		else
+-		{
+-			charger->cfg_items.charger_led_exist = true;
+-			gpio_direction_output(charger->cfg_items.gpio_led_inner_pin, charger->cfg_items.gpio_led_active_low);
++	charger->cfg_items.gpio_led_inner_pin_new = of_get_named_gpio_flags(charger->node,
++			GPIO_NAME_LED_INNER_CHARGER "_new", 0, &flags);
++	charger->cfg_items.gpio_led_active_low = flags & OF_GPIO_ACTIVE_LOW;
++	charger->cfg_items.gpio_led_inner_pin = board_gpio_claim(charger->cfg_items.gpio_led_inner_pin,
++			GPIO_NAME_LED_INNER_CHARGER, !charger->cfg_items.gpio_led_active_low);
++	charger->cfg_items.gpio_led_inner_pin_new = board_gpio_claim(charger->cfg_items.gpio_led_inner_pin_new,
++			GPIO_NAME_LED_INNER_CHARGER, !charger->cfg_items.gpio_led_active_low);
++	charger->cfg_items.charger_led_exist =
++		charger->cfg_items.gpio_led_inner_pin >= 0 || charger->cfg_items.gpio_led_inner_pin_new >= 0;
++
++	/* RG35XX: the ldo5 rail is switched on (a failure to enable it fails the probe, as on the vendor kernel) */
++	ldo5_reg = regulator_get(NULL, "ldo5");
++	if (IS_ERR(ldo5_reg)) {
++		printk("Nova err,regulator_get fail\n");
++		ldo5_reg = NULL;
++	} else {
++		ret = regulator_enable(ldo5_reg);
++	}
++
++	/* RG35XX: work LED (inverted in the charger boot mode) and low-battery LED (starts off) */
++	work_led_pin = of_get_named_gpio_flags(charger->node, "work_led_ctl", 0, &flags);
++	work_led_pin_new = of_get_named_gpio_flags(charger->node, "work_led_ctl_new", 0, &flags);
++	work_led_level = flags & OF_GPIO_ACTIVE_LOW;
++	work_led_pin = board_gpio_claim(work_led_pin, "inner_work_led_ctl",
++			owl_get_boot_mode() == OWL_BOOT_MODE_CHARGER ? !work_led_level : work_led_level);
++	work_led_pin_new = board_gpio_claim(work_led_pin_new, "inner_work_led_ctl_new",
++			owl_get_boot_mode() == OWL_BOOT_MODE_CHARGER ? !work_led_level : work_led_level);
++	low_led_pin = of_get_named_gpio_flags(charger->node, "low_power_led_ctl", 0, &flags);
++	low_led_pin_new = of_get_named_gpio_flags(charger->node, "low_power_led_ctl_new", 0, &flags);
++	low_led_level = flags & OF_GPIO_ACTIVE_LOW;
++	low_led_pin = board_gpio_claim(low_led_pin, "inner_low_power_led_ctl", !low_led_level);
++	low_led_pin_new = board_gpio_claim(low_led_pin_new, "inner_low_power_led_ctl_new", !low_led_level);
++
++	/* RG35XX: USB OTG: ID input, switch and VBUS enable outputs (off until the poll sees the ID pin high) */
++	otg_id_pin = board_gpio_claim(of_get_named_gpio_flags(charger->node, "myotg_id", 0, &flags), "inner_otg_id", -1);
++	otg_1_pin = board_gpio_claim(of_get_named_gpio_flags(charger->node, "otg_1_ctl", 0, &flags), "inner_otg_sw_ctl", 0);
++	otg_2_pin = board_gpio_claim(of_get_named_gpio_flags(charger->node, "otg_2_ctl", 0, &flags), "inner_otg_en_ctl", 0);
+ 
+-		}
+-	}
+ 	/* get gpio config for external charge control */
+ 	charger->cfg_items.gpio_ext_chg_ctrl_pin = of_get_named_gpio_flags(charger->node, GPIO_NAME_EXT_CTRL_CHARGER, 0, &flags);
+ 	if (charger->cfg_items.gpio_ext_chg_ctrl_pin >= 0)
+@@ -2678,21 +3004,23 @@ static  int atc260x_power_probe(struct platform_device *pdev)
+ 	if (atc260x_get_cfg_item(charger) != 0)
+ 		goto err_create_sysfs;
+ 
+-	if (charger->cfg_items.ext_dcdc_exist)
++	/* RG35XX: no external DC-DC; its PWM drives the rumble motor, started stopped (duty 0) */
++	moto_pwm = pwm_get(&pdev->dev, NULL);
++	if (IS_ERR(moto_pwm))
+ 	{
+-		charger->pwm = pwm_get(&pdev->dev, NULL);
+-		if (IS_ERR(charger->pwm)) 
+-		{
+-			pr_err("%s, unable to request PWM!\n", __FUNCTION__);
+-			goto err_usb;
+-		}
++		pr_err("%s, unable to request PWM!\n", __FUNCTION__);
++		moto_pwm = NULL;
++		goto err_usb;
++	}
+ 
+-		if (0 == charger->pwm->period) 
+-		{
+-			pr_err("%s, ext_dcdc_pwm->period is zero!\n", __FUNCTION__);
+-			goto err_usb;
+-		}
++	if (0 == moto_pwm->period)
++	{
++		pr_err("%s, ext_moto_pwm->period is zero!\n", __FUNCTION__);
++		goto err_usb;
+ 	}
++	pwm_config(moto_pwm, 0, moto_pwm->period);
++	pwm_set_polarity(moto_pwm, PWM_POLARITY_NORMAL);
++	pwm_enable(moto_pwm);
+ 
+ 	atc260x_charger_init(charger);
+ 	
+@@ -2717,10 +3045,13 @@ static  int atc260x_power_probe(struct platform_device *pdev)
+ 	charger->charger_wq =
+ 		create_singlethread_workqueue("atc260x_charger_wq");
+ 	if (charger->charger_wq == NULL) 
+-	{
++	{
+ 		power_dbg("[%s]:failed to create work queue\n", __func__);
+ 		goto err_destroy_wakelock;
+ 	}
++	/* RG35XX: set up before the monitor can start it */
++	INIT_DELAYED_WORK(&charger->led_work, allen_led_poll);
++	led_poll_started = false;
+ 	INIT_DELAYED_WORK(&charger->work, atc260x_charging_monitor);
+ 	queue_delayed_work(charger->charger_wq, &charger->work, 0 * HZ);
+ 
+@@ -2786,14 +3117,17 @@ static int atc260x_power_suspend(struct platform_device *pdev, pm_message_t m)
+ 		pwm_config(charger->pwm,
+ 				((charger->pwm->period) >> 6) * PWM_MAX_LEVEL,
+ 					charger->pwm->period);
+-	if (charger->cfg_items.charger_led_exist) 
++	if (charger->cfg_items.charger_led_exist)
+ 	{
+-		gpio_free(charger->cfg_items.gpio_led_inner_pin);	
++		if (charger->cfg_items.gpio_led_inner_pin >= 0)
++			gpio_free(charger->cfg_items.gpio_led_inner_pin);
++		if (charger->cfg_items.gpio_led_inner_pin_new >= 0)
++			gpio_free(charger->cfg_items.gpio_led_inner_pin_new);
+ 	}
+ 
+-	if (charger->cfg_items.ext_charger_exist) 
++	if (charger->cfg_items.ext_charger_exist)
+ 	{
+-		gpio_free(charger->cfg_items.gpio_ext_chg_ctrl_pin);	
++		gpio_free(charger->cfg_items.gpio_ext_chg_ctrl_pin);
+ 	}
+ 	log_event_none(LOG_HEADER_SUSPEND);
+ 	getnstimeofday(&suspend_ts);
+@@ -2819,8 +3153,14 @@ static int atc260x_power_resume(struct platform_device *pdev)
+ 	
+ 	if (charger->cfg_items.charger_led_exist) 
+ 	{
+-		gpio_request(charger->cfg_items.gpio_led_inner_pin, GPIO_NAME_LED_INNER_CHARGER);
+-		gpio_direction_output(charger->cfg_items.gpio_led_inner_pin, 0);
++		if (charger->cfg_items.gpio_led_inner_pin >= 0) {
++			gpio_request(charger->cfg_items.gpio_led_inner_pin, GPIO_NAME_LED_INNER_CHARGER);
++			gpio_direction_output(charger->cfg_items.gpio_led_inner_pin, 0);
++		}
++		if (charger->cfg_items.gpio_led_inner_pin_new >= 0) {
++			gpio_request(charger->cfg_items.gpio_led_inner_pin_new, GPIO_NAME_LED_INNER_CHARGER);
++			gpio_direction_output(charger->cfg_items.gpio_led_inner_pin_new, 0);
++		}
+ 	}
+ 
+ 	if (charger->cfg_items.ext_charger_exist) 
+@@ -2855,23 +3195,39 @@ static void atc260x_power_shutdown(struct platform_device *pdev)
+ {
+ 	struct atc260x_power *atc260x_power = platform_get_drvdata(pdev);
+ 	struct atc260x_charger *charger = &atc260x_power->charger;
+-	cancel_delayed_work_sync(&charger->work); 
++	int i;
++	const int board_pins[] = { work_led_pin, work_led_pin_new, low_led_pin, low_led_pin_new,
++				   otg_id_pin, otg_1_pin, otg_2_pin };
+ 
+-	if (charger->cfg_items.charger_led_exist) 
++	cancel_delayed_work_sync(&charger->work);
++	/* RG35XX: the vendor kernel left the LED poll running here; it is stopped before its GPIOs go */
++	cancel_delayed_work_sync(&charger->led_work);
++
++	if (charger->cfg_items.charger_led_exist)
+ 	{
+-		gpio_free(charger->cfg_items.gpio_led_inner_pin);	
++		if (charger->cfg_items.gpio_led_inner_pin >= 0)
++			gpio_free(charger->cfg_items.gpio_led_inner_pin);
++		if (charger->cfg_items.gpio_led_inner_pin_new >= 0)
++			gpio_free(charger->cfg_items.gpio_led_inner_pin_new);
+ 	}
+ 
+-	if (charger->cfg_items.ext_charger_exist) 
+-	{
+-		gpio_free(charger->cfg_items.gpio_ext_chg_ctrl_pin);	
++	if (ldo5_reg) {
++		regulator_disable(ldo5_reg);
++		regulator_put(ldo5_reg);
+ 	}
++	for (i = 0; i < ARRAY_SIZE(board_pins); i++)
++		if (board_pins[i] >= 0)
++			gpio_free(board_pins[i]);
+ 
+-	if (charger->cfg_items.ext_dcdc_exist == 1) 
++	if (charger->cfg_items.ext_charger_exist)
+ 	{
+-		pwm_disable(charger->pwm);
+-		pwm_free(charger->pwm);
+-		charger->pwm = NULL;
++		gpio_free(charger->cfg_items.gpio_ext_chg_ctrl_pin);
++	}
++
++	if (moto_pwm) {
++		pwm_disable(moto_pwm);
++		pwm_free(moto_pwm);
++		moto_pwm = NULL;
+ 	}
+ 	if (charger->atc260x == NULL)
+ 		return ;
+-- 
+2.53.0
+

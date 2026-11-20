@@ -1,0 +1,134 @@
+From f8faa44deebfa641a9639900b705e88e319fe685 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Fri, 20 Nov 2026 01:01:56 +0100
+Subject: owl dss: run-time tunable DE FIFO critical settings (RG35XX underflow
+ tests)
+
+de_path_fcr_set() programs the display FIFO "critical" settings on every
+flip: critical control 0 and DE_OVL_CRITICAL_CFG 0x10 for the top layer,
+control 2 for the others; DE_CRITICAL_NUM (DE + 0x08) is never written.
+On the RG35XX, a CPU write-combined store stream plus a flipping display
+underflows the DE FIFO on most frames, while the same stream on a static
+(never flipped) display does not.
+
+To tune these against that reproducer without a rebuild per value, they
+become parameters of owl_dss (/sys/module/owl_dss/parameters/):
+- crit_rewrite: 1 = program on every flip (vendor), 0 = only when a value
+  changes;
+- crit_ctl: the top layer's critical control (0-3);
+- crit_thresh: the top layer's DE_OVL_CRITICAL_CFG;
+- crit_num: DE_CRITICAL_NUM, -1 = leave it untouched.
+The defaults keep the vendor behaviour exactly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/owl/dss/de_atm7059.c | 58 +++++++++++++++++++++++++++---
+ 1 file changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/video/owl/dss/de_atm7059.c b/drivers/video/owl/dss/de_atm7059.c
+index 04310d9c..bb53b2c8 100755
+--- a/drivers/video/owl/dss/de_atm7059.c
++++ b/drivers/video/owl/dss/de_atm7059.c
+@@ -29,6 +29,7 @@
+ #include <linux/jiffies.h>
+ #include <linux/seq_file.h>
+ #include <linux/delay.h>
++#include <linux/moduleparam.h>
+ #include <linux/workqueue.h>
+ #include <linux/hardirq.h>
+ #include <linux/interrupt.h>
+@@ -329,25 +330,70 @@ static bool de_video_is_enabled(enum owl_de_path_id path, enum owl_plane video)
+ 	return val;
+ }
+ 
++/*
++ * RG35XX: the DE FIFO "critical" settings the flip programs, adjustable at run time through
++ * /sys/module/owl_dss/parameters/ to tune them against display FIFO underflows. The defaults are the vendor
++ * behaviour: on every flip the top layer gets critical control 0 and threshold 0x10, the other layers control 2,
++ * and DE_CRITICAL_NUM is left as the boot left it.
++ */
++#define DE_CRITICAL_NUM				0x0008
++
++static int crit_rewrite = 1;
++module_param(crit_rewrite, int, 0644);
++MODULE_PARM_DESC(crit_rewrite, "1: program the critical settings on every flip (vendor); 0: only when they change");
++static int crit_ctl;
++module_param(crit_ctl, int, 0644);
++MODULE_PARM_DESC(crit_ctl, "DE_OVL_CFG critical control (0-3) of the top layer (vendor 0)");
++static int crit_thresh = 0x10;
++module_param(crit_thresh, int, 0644);
++MODULE_PARM_DESC(crit_thresh, "DE_OVL_CRITICAL_CFG of the top layer (vendor 0x10)");
++static int crit_num = -1;
++module_param(crit_num, int, 0644);
++MODULE_PARM_DESC(crit_num, "DE_CRITICAL_NUM; -1 leaves it untouched (vendor)");
++
++/**
++ * @brief Whether the critical settings must be (re)programmed on this flip.
++ * @return true on every flip with crit_rewrite, else only when a parameter changed since the last time.
++ */
++static bool de_critical_due(void)
++{
++	static int last_ctl = -1, last_thresh = -1, last_num = -2;
++
++	if (!crit_rewrite && last_ctl == crit_ctl && last_thresh == crit_thresh && last_num == crit_num)
++		return false;
++	last_ctl = crit_ctl;
++	last_thresh = crit_thresh;
++	last_num = crit_num;
++	return true;
++}
++
++/**
++ * @brief Programs the overlays' FIFO critical settings, sets the path's FCR ("go", latched at the next vblank) and
++ *        reports and clears a DE FIFO underflow.
++ * @param path The display path being flipped.
++ */
+ static void de_path_fcr_set(enum owl_de_path_id path)
+ {
+ 	u32 val;
+ 	int i = 0;
+ 	bool found_first_layer = true;
++	bool due = de_critical_due();
+ 	
+-	if(path == OWL_DSS_PATH1_ID){		
++	if (!due) {
++		/* RG35XX: settings unchanged and crit_rewrite off: leave them */
++	} else if(path == OWL_DSS_PATH1_ID){		
+ 		for(i = 3 ; i >= 0 ; i --){
+ 			val = de_read_reg(DE_OVL_COOR(path,i));		
+ 			if(((val  & 0xffff0000) == 0)
+ 				&& de_video_is_enabled(path,i)){
+ 				if(found_first_layer){
+ 					val = de_read_reg(DE_OVL_CFG(i));
+-					val = REG_SET_VAL(val, 0, 
++					val = REG_SET_VAL(val, crit_ctl & 3, 
+ 					        DE_OVL_CFG_CRITICAL_CTL_END_BIT,
+ 					        DE_OVL_CFG_CRITICAL_CTL_BEGIN_BIT
+ 						   );
+ 					de_write_reg(DE_OVL_CFG(i), val);
+-					de_write_reg(DE_OVL_CRITICAL_CFG(i), 0x10);
++					de_write_reg(DE_OVL_CRITICAL_CFG(i), crit_thresh);
+ 					found_first_layer = false;
+ 				}else{
+ 					val = de_read_reg(DE_OVL_CFG(i));
+@@ -370,13 +416,15 @@ static void de_path_fcr_set(enum owl_de_path_id path)
+ 		}
+ 	}else{
+ 		val = de_read_reg(DE_OVL_CFG(3));
+-					val = REG_SET_VAL(val, 0, 
++					val = REG_SET_VAL(val, crit_ctl & 3, 
+ 					        DE_OVL_CFG_CRITICAL_CTL_END_BIT,
+ 					        DE_OVL_CFG_CRITICAL_CTL_BEGIN_BIT
+ 						   );
+ 		de_write_reg(DE_OVL_CFG(3), val);
+-		de_write_reg(DE_OVL_CRITICAL_CFG(3), 0x10);
++		de_write_reg(DE_OVL_CRITICAL_CFG(3), crit_thresh);
+ 	}
++	if (due && crit_num >= 0)
++		de_write_reg(DE_CRITICAL_NUM, crit_num);	/* RG35XX: unused by the vendor driver */
+ 	val = de_read_reg(DE_PATH_FCR(path));
+ 	val = REG_SET_VAL(val, 1, DE_PATH_FCR_BIT, DE_PATH_FCR_BIT);
+ 	
+-- 
+2.53.0
+

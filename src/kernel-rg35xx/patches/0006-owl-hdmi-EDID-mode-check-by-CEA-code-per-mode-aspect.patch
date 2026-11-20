@@ -1,0 +1,230 @@
+From fcb627f310ba5ef761848b71c6520d785b4e8b54 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 19:16:50 +0100
+Subject: [PATCH 6/7] owl hdmi: EDID mode check by CEA code, per-mode aspect,
+ quieter log
+
+Matches the running RG35XX kernel:
+- hdmi_check_vid_available() looks the mode's CEA code up in the EDID
+  video format bitmap (the public source shifted it by the OWL_TV_MOD_*
+  enum, so the EDID check tested unrelated bits);
+- the boot HDMI mode is kept only when the sink supports it; the chosen
+  mode is logged ("best_vid is %d"); best_vid now defaults to DVI instead
+  of being left uninitialised when the EDID lists no known mode;
+- hdmi_cm gains the AVI picture aspect (4:3 for 480p/576p, 16:9 for the
+  HD modes and DVI), set with the mode and sent in the AVI infoframe
+  (was always 16:9);
+- no default_resolution property means no user mode (the public source
+  passed a NULL name to strcmp);
+- OWL_HDMI info printks off (errors stay).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/video/owl/displays/hdmi/hdmi.c        | 66 +++++++++++++------
+ drivers/video/owl/displays/hdmi/hdmi.h        |  7 +-
+ drivers/video/owl/displays/hdmi/hdmi_packet.c |  2 +-
+ 3 files changed, 54 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/video/owl/displays/hdmi/hdmi.c b/drivers/video/owl/displays/hdmi/hdmi.c
+index 7cdff236..d916ff67 100755
+--- a/drivers/video/owl/displays/hdmi/hdmi.c
++++ b/drivers/video/owl/displays/hdmi/hdmi.c
+@@ -182,43 +182,43 @@ static struct hdmi_config cea_timings[] = {
+ 		{ 1920, 1080, 148500, 44, 88, 148, 5, 4, 36,
+ 			OWLDSS_SIG_ACTIVE_HIGH, OWLDSS_SIG_ACTIVE_HIGH,
+ 			false, 1, 0, },
+-		{ 16, HDMI_HDMI,OWL_TV_MOD_1080P_60HZ},
++		{ 16, HDMI_HDMI,OWL_TV_MOD_1080P_60HZ, HDMI_ASPECT_16_9},
+ 	},
+ 	{
+ 		{ 1920, 1080, 74250, 44, 528, 148, 5, 4, 36,
+ 			OWLDSS_SIG_ACTIVE_HIGH, OWLDSS_SIG_ACTIVE_HIGH,
+ 			false, 1, 0, },
+-		{ 31, HDMI_HDMI,OWL_TV_MOD_1080P_50HZ },
++		{ 31, HDMI_HDMI,OWL_TV_MOD_1080P_50HZ, HDMI_ASPECT_16_9 },
+ 	},
+ 	{
+ 		{ 1280, 720, 74250, 40, 110, 220, 5, 5, 20,
+ 			OWLDSS_SIG_ACTIVE_HIGH, OWLDSS_SIG_ACTIVE_HIGH,
+ 			false, 1, 0, },
+-		{ 4, HDMI_HDMI,OWL_TV_MOD_720P_60HZ},
++		{ 4, HDMI_HDMI,OWL_TV_MOD_720P_60HZ, HDMI_ASPECT_16_9},
+ 	},
+ 	{
+ 		{ 1280, 720, 74250, 40, 440, 220, 5, 5, 20,
+ 			OWLDSS_SIG_ACTIVE_HIGH, OWLDSS_SIG_ACTIVE_HIGH,
+ 			false, 1, 0, },
+-		{ 19, HDMI_HDMI,OWL_TV_MOD_720P_50HZ},
++		{ 19, HDMI_HDMI,OWL_TV_MOD_720P_50HZ, HDMI_ASPECT_16_9},
+ 	},
+ 	{
+ 		{ 720, 576, 27000, 64, 12, 68, 5, 5, 39,
+ 			OWLDSS_SIG_ACTIVE_LOW, OWLDSS_SIG_ACTIVE_LOW,
+ 			false, 1, 0, },
+-		{ 17, HDMI_HDMI,OWL_TV_MOD_576P},
++		{ 17, HDMI_HDMI,OWL_TV_MOD_576P, HDMI_ASPECT_4_3},
+ 	},	
+ 	{
+ 		{ 720, 480, 27000, 62, 16, 60, 6, 9, 30,
+ 			OWLDSS_SIG_ACTIVE_LOW, OWLDSS_SIG_ACTIVE_LOW,
+ 			false, 7, 0, },
+-		{ 2, HDMI_HDMI,OWL_TV_MOD_480P},
++		{ 2, HDMI_HDMI,OWL_TV_MOD_480P, HDMI_ASPECT_4_3},
+ 	},		
+ 	{
+ 		{ 1280, 720, 74250, 40, 110, 220, 5, 5, 20,
+ 			OWLDSS_SIG_ACTIVE_HIGH, OWLDSS_SIG_ACTIVE_HIGH,
+ 			false, 1, 0, },
+-		{ 126, HDMI_DVI,OWL_TV_MOD_DVI},
++		{ 126, HDMI_DVI,OWL_TV_MOD_DVI, HDMI_ASPECT_16_9},
+ 	},
+ };
+ 
+@@ -291,10 +291,6 @@ static int hdmi_get_vid_by_times(struct owl_video_timings * times)
+ 	 return -1;
+ }
+ 
+-static bool hdmi_check_vid_available(int vid)
+-{
+-	return (((hdmi.edid.video_formats[0] >> vid) & 0x01)==1);
+-}
+ static int hdmi_get_code_by_vid(int vid)
+ {
+      int i = 0;
+@@ -305,6 +301,35 @@ static int hdmi_get_code_by_vid(int vid)
+ 	 }
+ 	 return -1;
+ }
++
++/**
++ * @brief RG35XX: AVI picture aspect of a mode.
++ * @param vid OWL_TV_MOD_* of the mode.
++ * @return HDMI_ASPECT_* from cea_timings, or -1 for an unknown vid.
++ */
++static int hdmi_get_aspect_by_vid(int vid)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(cea_timings); i++)
++		if (cea_timings[i].cm.vid == vid)
++			return cea_timings[i].cm.aspect;
++	return -1;
++}
++
++/**
++ * @brief Whether the sink's EDID lists a mode.
++ * @param vid OWL_TV_MOD_* of the mode.
++ * @return true when the CEA code of @p vid is set in the EDID video format bitmap.
++ *
++ * RG35XX: the bitmap is indexed by CEA code; the public source shifted it by the vid enum.
++ */
++static bool hdmi_check_vid_available(int vid)
++{
++	int code = hdmi_get_code_by_vid(vid);
++
++	return code >= 0 && code < 32 && ((hdmi.edid.video_formats[0] >> code) & 0x01);
++}
+ static bool  is_hdmi_power_on(void)
+ {
+ 	return ((hdmihw_read_reg(HDMI_CR) & 0x01) != 0);
+@@ -460,10 +485,11 @@ static int hdmi_probe_pdata(struct platform_device *pdev)
+ 
+ static int check_best_vid_from_edid(struct hdmi_edid *edid)
+ {
+-	int best_vid;
++	int best_vid = OWL_TV_MOD_DVI;	/* RG35XX: defined when the EDID lists no known mode */
+ 	int i = 0;	
+ 	
+-	if(boot_hdmi_vid != -1)	{
++	/* RG35XX: the boot mode is kept only if the sink supports it */
++	if(boot_hdmi_vid != -1 && hdmi_check_vid_available(boot_hdmi_vid))	{
+ 		
+ 		best_vid =  boot_hdmi_vid;
+ 		boot_hdmi_vid = -1;
+@@ -489,6 +515,7 @@ static int check_best_vid_from_edid(struct hdmi_edid *edid)
+ 		}
+ 	}
+ 		
++	DEBUG_ERR("best_vid is %d\n", best_vid);
+ 	hdmi.ip_data.cfg.cm.vid = best_vid;
+ 	
+ 	return best_vid;
+@@ -646,6 +673,7 @@ void owldss_hdmi_display_set_timing(struct owl_dss_device *dssdev,struct owl_vid
+ 	}	
+ 	hdmi.ip_data.cfg.cm.vid = vid;
+ 	hdmi.ip_data.cfg.cm.code = hdmi_get_code_by_vid(vid);
++	hdmi.ip_data.cfg.cm.aspect = hdmi_get_aspect_by_vid(vid);	/* RG35XX */
+ 	hdmi.ip_data.cfg.cm.mode = hdmi.edid.isHDMI;	
+ 	
+ 	mutex_unlock(&hdmi.lock);
+@@ -668,6 +696,7 @@ void owldss_hdmi_display_set_vid(struct owl_dss_device *dssdev,int vid)
+ 	}	
+ 	hdmi.ip_data.cfg.cm.vid = vid;
+ 	hdmi.ip_data.cfg.cm.code = hdmi_get_code_by_vid(vid);
++	hdmi.ip_data.cfg.cm.aspect = hdmi_get_aspect_by_vid(vid);	/* RG35XX */
+ 	hdmi.ip_data.cfg.cm.mode = hdmi.edid.isHDMI;	
+ 	DEBUG_ON("owldss_hdmi_display_set_vid vid %d ,code %d mode %d  \n",hdmi.ip_data.cfg.cm.vid,hdmi.ip_data.cfg.cm.code,hdmi.ip_data.cfg.cm.mode);
+ 	mutex_unlock(&hdmi.lock);
+@@ -1034,12 +1063,11 @@ static int of_get_hdmi_data(struct platform_device *pdev, struct hdmi_property *
+ 		
+ 	}
+ 	
+-	if (of_property_read_string(of_node, "default_resolution", &default_resulation)) {
+-		default_resulation = NULL;
+-		//DEBUG_ON("cat not get bit_invert  %d\n", hdmi_data->bit_invert);
+-	}
+-	
+-	user_config_vid = string_to_data_fmt(default_resulation);
++	/* RG35XX: without the property there is no user mode (the public source looked up a NULL name) */
++	if (of_property_read_string(of_node, "default_resolution", &default_resulation))
++		user_config_vid = -1;
++	else
++		user_config_vid = string_to_data_fmt(default_resulation);
+ 	
+ 	if(boot_hdmi_vid == -1)
+ 	{
+diff --git a/drivers/video/owl/displays/hdmi/hdmi.h b/drivers/video/owl/displays/hdmi/hdmi.h
+index 59add2bc..4b94ac8a 100755
+--- a/drivers/video/owl/displays/hdmi/hdmi.h
++++ b/drivers/video/owl/displays/hdmi/hdmi.h
+@@ -23,7 +23,7 @@
+ #define _OWL_HDMI_H
+ #include <video/owldss.h>
+ 
+-#define PRINGK_ON
++#define PRINGK_ONx	/* RG35XX: HDMI info printks off, as in the running kernel */
+ #ifdef PRINGK_ON
+ #define DEBUG_ON(format, ...) \
+ 	do { \
+@@ -214,10 +214,15 @@ struct hdmi_video_format {
+ 	u32			x_res;	/* pixel per line */
+ };
+ 
++/* RG35XX: AVI infoframe picture aspect ratio (M1:M0) */
++#define HDMI_ASPECT_4_3		1
++#define HDMI_ASPECT_16_9	2
++
+ struct hdmi_cm {
+ 	int	code;
+ 	int	mode;
+ 	int vid;
++	int	aspect;	/* RG35XX: HDMI_ASPECT_*, sent in the AVI infoframe */
+ };
+ 
+ struct hdmi_settings {
+diff --git a/drivers/video/owl/displays/hdmi/hdmi_packet.c b/drivers/video/owl/displays/hdmi/hdmi_packet.c
+index 1e43f6a2..e1211622 100755
+--- a/drivers/video/owl/displays/hdmi/hdmi_packet.c
++++ b/drivers/video/owl/displays/hdmi/hdmi_packet.c
+@@ -227,7 +227,7 @@ int hdmi_gen_avi_infoframe(struct hdmi_ip_data *ip_data)
+ {
+     static u8 pkt[32];
+     u32 checksum=0, i=0;
+-    u8 AR=2;
++    u8 AR = ip_data->cfg.cm.aspect;	/* RG35XX: per mode (4:3 for 480p/576p); was always 16:9 */
+     /* clear buffer */
+     for(i=0;i<32;i++)
+         pkt[i]=0;
+-- 
+2.53.0
+

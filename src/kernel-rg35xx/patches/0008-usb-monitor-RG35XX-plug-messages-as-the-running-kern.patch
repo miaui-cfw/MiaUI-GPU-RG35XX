@@ -1,0 +1,117 @@
+From 2604fb65d7478a55809d3ca9107da73d3062956f Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <claude@anthropic.com>
+Date: Thu, 19 Nov 2026 23:12:24 +0100
+Subject: usb monitor: RG35XX plug messages as the running kernel reports them
+
+The running RG35XX kernel is built without CONFIG_USB_PLATFORM_LINUX:
+its mon_config_store handles usb_con_msg, which the rootfs usbnet.sh and
+D50adbd write (USB_A_OUT, then USB_B_IN) to switch the port to device
+mode for ADB and the USB network. With the option on, those writes do
+nothing and the gadget never reaches the PC. The config turns it off;
+this adds what the vendor changed in mon_port_putt_msg on top of it:
+- USB_B_IN sets soft VBUS valid for the controller, USB_B_OUT clears it;
+- in charger boot mode every message is also handled in the kernel
+  (dwc3/xhci plug state), since no userspace switches the port there;
+  the switch state still goes to userspace in every mode.
+
+Not ported: the public fix_vbus_reset code stays (the console's DTBs do
+not set it, so it is inert), and two log lines differ.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/usb/monitor/umonitor_api.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/usb/monitor/umonitor_api.c b/drivers/usb/monitor/umonitor_api.c
+index 385012ed..e00b0531 100755
+--- a/drivers/usb/monitor/umonitor_api.c
++++ b/drivers/usb/monitor/umonitor_api.c
+@@ -1185,6 +1185,22 @@ static void mon_port_wakeup_func(void)
+ 	return;
+ }
+ 
++#ifndef CONFIG_USB_PLATFORM_LINUX
++/**
++ * @brief RG35XX: sends a port message to userspace as a switch state, as the running kernel does.
++ *
++ * In charger boot mode no userspace switches the controller (usbnet.sh writes usb_con_msg in normal mode),
++ * so the message is handled here first.
++ * @param msg MON_MSG_* code, used as the switch state.
++ */
++static void mon_port_report_msg(unsigned int msg)
++{
++	if (owl_get_boot_mode() == OWL_BOOT_MODE_CHARGER)
++		monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);
++	switch_set_state(&my_mon->port_dev.sdev, msg);
++}
++#endif
++
+ static void mon_port_putt_msg(unsigned int msg)
+ {
+ 	struct mon_sysfs_status * pStatus;
+@@ -1208,11 +1224,12 @@ static void mon_port_putt_msg(unsigned int msg)
+ 			pStatus->pc_connected = 1;
+ 			pStatus->charger_connected = CONNECT_USB_PORT;//set usb pc first,it'll jude by dwc3 interrupt
+ 			sprintf(my_mon->port_dev.state_msg, "USB_B_IN");
++			p_hal->set_soft_vbus(p_hal, 1, 1);	/* RG35XX: VBUS valid for the controller */
+ 			
+ #ifdef CONFIG_USB_PLATFORM_LINUX
+ 			monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);//handle usb msg in monitor
+ #else
+-			switch_set_state(&my_mon->port_dev.sdev, msg);			    //handle usb msg through vold
++			mon_port_report_msg(msg);	/* RG35XX: switch state, in-kernel in charger mode */
+ #endif            
+ 			break;
+ 		case MON_MSG_USB_B_OUT:
+@@ -1224,10 +1241,11 @@ static void mon_port_putt_msg(unsigned int msg)
+ 			pStatus->pc_connected = 0;
+ 			pStatus->charger_connected = 0;
+ 			sprintf(my_mon->port_dev.state_msg, "USB_B_OUT");
++			p_hal->set_soft_vbus(p_hal, 0, 0);	/* RG35XX: back to the VBUS pin */
+ #ifdef CONFIG_USB_PLATFORM_LINUX
+ 			monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);//handle usb msg in monitor
+ #else
+-			switch_set_state(&my_mon->port_dev.sdev, msg);			    //handle usb msg through vold
++			mon_port_report_msg(msg);	/* RG35XX: switch state, in-kernel in charger mode */
+ #endif    
+ 			break;
+ 		case MON_MSG_USB_A_IN:
+@@ -1238,7 +1256,7 @@ static void mon_port_putt_msg(unsigned int msg)
+ #ifdef CONFIG_USB_PLATFORM_LINUX
+ 			monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);//handle usb msg in monitor
+ #else
+-			switch_set_state(&my_mon->port_dev.sdev, msg);			    //handle usb msg through vold
++			mon_port_report_msg(msg);	/* RG35XX: switch state, in-kernel in charger mode */
+ #endif    
+ 			wake_lock_timeout(&my_mon->monitor_wake_lock, 10*HZ);
+ 			printk("----monitor_wake_lock for 10s \n");
+@@ -1251,7 +1269,7 @@ static void mon_port_putt_msg(unsigned int msg)
+ #ifdef CONFIG_USB_PLATFORM_LINUX
+ 			monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);//handle usb msg in monitor
+ #else
+-			switch_set_state(&my_mon->port_dev.sdev, msg);			    //handle usb msg through vold
++			mon_port_report_msg(msg);	/* RG35XX: switch state, in-kernel in charger mode */
+ #endif    
+ 			wake_lock_timeout(&my_mon->monitor_wake_lock, 10*HZ);
+ 			break;
+@@ -1263,7 +1281,7 @@ static void mon_port_putt_msg(unsigned int msg)
+ #ifdef CONFIG_USB_PLATFORM_LINUX
+ 			monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);//handle usb msg in monitor
+ #else
+-			switch_set_state(&my_mon->port_dev.sdev, msg);			    //handle usb msg through vold
++			mon_port_report_msg(msg);	/* RG35XX: switch state, in-kernel in charger mode */
+ #endif    
+ 			break;
+ 		case MON_MSG_USB_CHARGER_OUT:
+@@ -1274,7 +1292,7 @@ static void mon_port_putt_msg(unsigned int msg)
+ #ifdef CONFIG_USB_PLATFORM_LINUX
+ 			monitor_handle_plug_in_out_msg(my_mon->port_dev.state_msg);//handle usb msg in monitor
+ #else
+-			switch_set_state(&my_mon->port_dev.sdev, msg);			    //handle usb msg through vold
++			mon_port_report_msg(msg);	/* RG35XX: switch state, in-kernel in charger mode */
+ #endif    
+ 			break;
+ 		default:
+-- 
+2.53.0
+

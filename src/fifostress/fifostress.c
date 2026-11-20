@@ -188,6 +188,7 @@ static struct
     int audio;            ///< play silence through ALSA "default" (44100 Hz stereo S16), as the games' audio does
 } opt = { 60, 5, 0, 0, 0, 1, 0, 0, 0, 1, "565", 0, 0, 0, -1, 1, 0, "", 1, 10, 0, 0 };
 
+static int s_noSwap = 0;                  ///< --no-swap: glFinish each frame instead of eglSwapBuffers (no GPU flips)
 static const char* s_replayPath = NULL;   ///< --replay: a gltrace capture played instead of the synthetic load
 static int s_skipOps[16], s_skipCount = 0; ///< --skip: record types left out of the replay
 static const char* s_chdPath = NULL;      ///< --chd: CHD image decompressed alongside
@@ -523,6 +524,8 @@ static void usage(void)
          "  --flip-at MS     finish the frame, wait for the vsync, sleep MS, then flip: the flip lands MS into the scan\n"
          "                   (ramp parameter flipat, in 0.1 ms steps)\n"
          "  --finish         glFinish before the swap\n"
+         "  --no-swap        render each frame and glFinish, but never swap: the GPU works, its driver never flips\n"
+         "                   (flips then come only from another tool, e.g. panflip)\n"
          "  --ramp P:STEP:S  raise P (fill|tex|uploads|cpu|fbo) by STEP every S seconds until an underflow\n"
          "  --replay FILE    loop the window of a gltrace capture (gltrace.so) instead of the synthetic load\n"
          "  --chd FILE[:HPS] read + decompress a CHD image (libchdr) alongside, HPS hunks a second (0: flat out;\n"
@@ -567,6 +570,7 @@ static void parseArgs(int argc, char** argv)
         else if (!strcmp(a, "--no-vsync")) opt.vsyncWait = 0;
         else if (!strcmp(a, "--flip-at") && n) opt.flipAtUs = (int)(atof(argv[++i]) * 1000);
         else if (!strcmp(a, "--finish")) opt.finish = 1;
+        else if (!strcmp(a, "--no-swap")) s_noSwap = 1;
         else if (!strcmp(a, "--ramp") && n)
             sscanf(argv[++i], "%15[^:]:%d:%d", opt.rampParam, &opt.rampStep, &opt.rampSeconds);
         else if (!strcmp(a, "--json")) opt.json = 1;
@@ -858,7 +862,10 @@ int main(int argc, char** argv)
             while (now() < until)
                 ;
         }
-        egl.SwapBuffers(dpy, surf);
+        if (s_noSwap)
+            gl.Finish();
+        else
+            egl.SwapBuffers(dpy, surf);
 
         const double t = now();
         const double ft = t - last;
