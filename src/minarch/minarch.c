@@ -70,6 +70,9 @@ static struct {
     int pending;   // HW_PENDING_*
     unsigned fbo;
     struct retro_hw_render_callback cb;
+    int resize;                 // the FBO needs want_w x want_h before the core's next frame
+    unsigned want_w, want_h;
+    unsigned seen_w, seen_h;    // the largest frame the core has reported: the FBO never goes below it
 } hwr;
 
 // ASSET_TROPHY is 10x10 in the atlas and stands in for the word
@@ -157,7 +160,15 @@ __asm__(
 #else
 void Core_callSavingVFP(void (*fn)(void)) { fn(); }
 #endif
+static void HW_applyResize(void);
+/**
+ * @brief Runs one frame of the core.
+ *
+ * A --gl FBO size change asked for during the previous frame is applied first: here the GL state is
+ * minarch's, not the core's half-drawn frame's.
+ */
 static void Core_run(void) {
+    if (hwr.resize) HW_applyResize();
     Core_callSavingVFP(core.run);
 }
 
@@ -2024,6 +2035,7 @@ static bool HW_setRender(unsigned cmd, struct retro_hw_render_callback* cb) {
 // Only the aspect needs handling: a new frame size is already caught by the
 // size check in video_refresh_callback. Costs nothing per frame: this runs only
 // when the core calls, and the rescale reuses that callback's dst_p==0 test.
+static void HW_requestSize(unsigned width, unsigned height);
 static void Core_applyGeometry(const struct retro_game_geometry* geom) {
     double a = geom->aspect_ratio;
     if (a<=0 && geom->base_width && geom->base_height) a = (double)geom->base_width / geom->base_height;
@@ -2032,6 +2044,8 @@ static void Core_applyGeometry(const struct retro_game_geometry* geom) {
         core.aspect_ratio = a;
         renderer.dst_p = 0; // selectScaler again on the next frame
     }
+    // --gl: the FBO follows the new active size (applied before the next frame, see Core_run)
+    if (hwr.active && geom->base_width && geom->base_height) HW_requestSize(geom->base_width, geom->base_height);
 }
 
 // Set once SND_init has opened the audio for the loaded game (see main).
@@ -2851,6 +2865,22 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
 // instead of queueing an upload, and the pointer (RETRO_HW_FRAME_BUFFER_VALID)
 // is never read. So the software path is the same code it always was.
 static void video_refresh_callback_hw(const void *data, unsigned width, unsigned height, size_t pitch) {
+    if (data==RETRO_HW_FRAME_BUFFER_VALID) {
+        // the core is done with this frame: its depth/stencil needn't go back to RAM
+        PLAT_hwFrameDone();
+        // A frame bigger than any before (Flycast renders above its 640x480 base size): if it doesn't
+        // fit the FBO it was clipped, so grow before the next one
+        if (width>hwr.seen_w || height>hwr.seen_h) {
+            hwr.seen_w = MAX(hwr.seen_w, width);
+            hwr.seen_h = MAX(hwr.seen_h, height);
+            int fw, fh;
+            PLAT_hwGetSize(&fw, &fh);
+            if ((int)width>fw || (int)height>fh) {
+                LOG_info("hw: %ux%u frame in a %ix%i FBO, growing it\n", width, height, fw, fh);
+                HW_requestSize(fw, fh);
+            }
+        }
+    }
     // whatever the core left bound, the compositor needs its own state back
     // before it draws anything - the UI resize and the toast upload included
     PLAT_hwRestoreState();
@@ -3000,9 +3030,45 @@ void Core_init(void) {
     set_input_poll_callback(input_poll_callback);
     set_input_state_callback(input_state_callback);
 }
+/**
+ * @brief Asks for an FBO of at least width x height, never smaller than the largest frame seen so far.
+ *
+ * Only records the request; Core_run applies it before the core's next frame.
+ * @param width  Wanted width (the core's active base width, or the current one when growing).
+ * @param height Wanted height.
+ */
+static void HW_requestSize(unsigned width, unsigned height) {
+    width  = MAX(width,  hwr.seen_w);
+    height = MAX(height, hwr.seen_h);
+    int fw, fh;
+    PLAT_hwGetSize(&fw, &fh);
+    hwr.want_w = width;
+    hwr.want_h = height;
+    hwr.resize = (int)width!=fw || (int)height!=fh;
+}
+/** @brief Applies a pending FBO size; the game quad then follows the new texture size. */
+static void HW_applyResize(void) {
+    hwr.resize = 0;
+    if (PLAT_hwResize(hwr.want_w, hwr.want_h)) renderer.dst_p = 0; // selectScaler: scale_hw rebuilds the quad
+}
+/**
+ * @brief Creates the FBO the core renders into, at the core's active size.
+ *
+ * base_width x base_height rather than max: on a tiler every pixel of the target costs bandwidth, and
+ * max is often far bigger (MorpheusCast reports a square for rotation). Frames that turn out bigger make
+ * it grow (video_refresh_callback_hw), and SET_GEOMETRY moves it (Core_applyGeometry).
+ * @param av_info The core's AV info from retro_get_system_av_info.
+ * @return 1 on success, 0 if the FBO couldn't be made.
+ */
 static int HW_init(const struct retro_system_av_info* av_info) {
-    hwr.fbo = PLAT_hwInit(av_info->geometry.max_width, av_info->geometry.max_height,
-                          hwr.cb.depth, hwr.cb.stencil, hwr.cb.bottom_left_origin);
+    unsigned w = av_info->geometry.base_width, h = av_info->geometry.base_height;
+    if (!w || !h) {
+        w = av_info->geometry.max_width;
+        h = av_info->geometry.max_height;
+    }
+    hwr.seen_w = hwr.seen_h = 0;
+    hwr.resize = 0;
+    hwr.fbo = PLAT_hwInit(w, h, hwr.cb.depth, hwr.cb.stencil, hwr.cb.bottom_left_origin);
     if (!hwr.fbo) return 0;
     hwr.active = 1;
 
@@ -5508,21 +5574,23 @@ int main(int argc , char* argv[]) {
     char tag_name[MAX_PATH];
     char ovlpath[MAX_PATH];
 
-    // minarch.elf [--32bits] [--gl] <core> <rom>, the options anywhere
+    // minarch.elf [--32bits] [--gl] [--gl565] <core> <rom>, the options anywhere.
+    // --gl565 is --gl with an RGB565 FBO: half the colour bandwidth, for cores whose output is opaque
     char* positional[2] = {NULL, NULL};
     int npositional = 0;
     for (int i=1; i<argc; i++) {
         if (!strcmp(argv[i], "--gl")) video_mode |= PLAT_VIDEO_GL | PLAT_VIDEO_32BIT;
+        else if (!strcmp(argv[i], "--gl565")) video_mode |= PLAT_VIDEO_GL | PLAT_VIDEO_32BIT | PLAT_VIDEO_GL565;
         else if (!strcmp(argv[i], "--32bits")) video_mode |= PLAT_VIDEO_32BIT;
         else if (!strncmp(argv[i], "--", 2)) LOG_warn("unknown option %s ignored\n", argv[i]);
         else if (npositional<2) positional[npositional++] = argv[i];
     }
     if (npositional<2) {
-        LOG_error("usage: %s [--32bits] [--gl] <core> <rom>\n", argv[0]);
+        LOG_error("usage: %s [--32bits] [--gl] [--gl565] <core> <rom>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    if (video_mode) LOG_info("video mode:%s%s\n", (video_mode & PLAT_VIDEO_32BIT) ? " 32bits" : "",
-                             (video_mode & PLAT_VIDEO_GL) ? " gl" : "");
+    if (video_mode) LOG_info("video mode:%s%s%s\n", (video_mode & PLAT_VIDEO_32BIT) ? " 32bits" : "",
+                             (video_mode & PLAT_VIDEO_GL) ? " gl" : "", (video_mode & PLAT_VIDEO_GL565) ? " 565" : "");
 
     strcpy(core_path, positional[0]);
     strcpy(rom_path, positional[1]);

@@ -333,6 +333,7 @@ void PLAT_quitInput();
 #define PLAT_VIDEO_32BIT  1 // 8888 window with depth/stencil, XRGB8888 cores accepted
 #define PLAT_VIDEO_GL     2 // libretro hardware rendering (implies the above)
 #define PLAT_VIDEO_RGB888 4 // 888 window, no depth: for when the ui is the whole picture (minui, tools)
+#define PLAT_VIDEO_GL565  8 // with PLAT_VIDEO_GL: the core's FBO is RGB565, not RGBA8 (minarch's --gl565)
 void PLAT_setVideoFlags(int flags);
 
 // The GPU-drawn ui, under the GFX_* functions above. Render targets are
@@ -361,6 +362,9 @@ int PLAT_supports32Bit(void);
 // that draws it instead of uploading - so a hardware frame goes through the
 // same renderer calls as a software one.
 unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_left); // the FBO, 0 on failure
+int PLAT_hwResize(int width, int height); // same FBO name, new storage (cleared); 1 if the size changed
+void PLAT_hwGetSize(int* width, int* height); // the FBO's allocated size
+void PLAT_hwFrameDone(void); // after each new HW frame: drop depth/stencil (EXT_discard_framebuffer), leaves the FBO bound
 void PLAT_hwQuit(void);
 void PLAT_hwRestoreState(void); // put back what the core may have changed
 void PLAT_hwPresent(int hw_frame); // 1: the FBO is the game layer, 0: software frames again

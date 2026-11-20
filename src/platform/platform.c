@@ -210,6 +210,11 @@ static struct {
 	GFX_Renderer* renderer; // where scale_hw finds the crop, from PLAT_getScaler
 	GLint max_attribs;
 	PFNGLBINDVERTEXARRAYOESPROC bind_vao; // NULL without OES_vertex_array_object
+	PFNGLDISCARDFRAMEBUFFEREXTPROC discard; // NULL without EXT_discard_framebuffer, or with no depth/stencil
+	GLenum depth_format; // of hw.depth, 0 for none
+	int stencil;     // hw.depth is also the stencil attachment
+	int rgb565;      // the colour texture is RGB565 (--gl565), not RGBA8
+	int max_size;    // the driver's texture/renderbuffer limit
 } hw;
 
 static int video_flags = 0;  // PLAT_VIDEO_*, from PLAT_setVideoFlags
@@ -1297,6 +1302,28 @@ static void set_filter(GLuint tex, GLint filter) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
 }
 
+/**
+ * @brief (Re)specifies the FBO's colour texture and depth/stencil storage at hw.w x hw.h.
+ *
+ * The texture and renderbuffer names stay, so the FBO keeps its attachments and a core that cached the
+ * framebuffer id still draws into the right place. Clears the result to black, so a repeat before the
+ * core's next frame shows black, not garbage. Leaves hw.fbo bound.
+ */
+static void hw_allocStorage(void) {
+	glBindTexture(GL_TEXTURE_2D, hw.tex);
+	if (hw.rgb565) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, hw.w, hw.h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
+	else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw.w, hw.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	if (hw.depth) {
+		glBindRenderbuffer(GL_RENDERBUFFER, hw.depth);
+		glRenderbufferStorage(GL_RENDERBUFFER, hw.depth_format, hw.w, hw.h);
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, hw.fbo);
+	glViewport(0, 0, hw.w, hw.h);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+}
+
 unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_left) {
 	const char* exts = (const char*)glGetString(GL_EXTENSIONS);
 	if (!exts) exts = "";
@@ -1304,13 +1331,14 @@ unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_l
 	GLint max_tex = 0, max_rb = 0;
 	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
 	glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_rb);
+	hw.max_size = MIN(max_tex, max_rb);
 	if (width<=0 || height<=0) {
 		width = FIXED_WIDTH;
 		height = FIXED_HEIGHT;
 	}
 	// non-power-of-two is fine here, so exactly what the core says it needs
-	hw.w = MIN(width,  MIN(max_tex, max_rb));
-	hw.h = MIN(height, MIN(max_tex, max_rb));
+	hw.w = MIN(width,  hw.max_size);
+	hw.h = MIN(height, hw.max_size);
 
 	glGenTextures(1, &hw.tex);
 	glBindTexture(GL_TEXTURE_2D, hw.tex);
@@ -1318,8 +1346,9 @@ unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_l
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, vid.game_filter);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	// RGBA8 rather than 565: cores can rely on destination alpha
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw.w, hw.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	// RGBA8 by default: cores can rely on destination alpha. --gl565 opts a core into half the colour
+	// bandwidth (opaque output only; GL_DITHER is free on 565 here).
+	hw.rgb565 = (video_flags & PLAT_VIDEO_GL565) != 0;
 
 	// GLES2 has no GL_DEPTH_STENCIL_ATTACHMENT: one packed D24S8 buffer goes
 	// to both attachment points. Depth alone gets 24 bits too, for the sake of
@@ -1334,20 +1363,31 @@ unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_l
 	GLenum depth_format = 0;
 	if (stencil) depth_format = GL_DEPTH24_STENCIL8_OES;
 	else if (depth) depth_format = depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16;
+	hw.depth_format = depth_format;
+	hw.stencil = stencil;
 	if (depth_format) {
 		glGenRenderbuffers(1, &hw.depth);
+		// a generated name becomes a renderbuffer only once bound: attaching it before that is
+		// GL_INVALID_OPERATION, and the FBO silently ends up with no depth/stencil
 		glBindRenderbuffer(GL_RENDERBUFFER, hw.depth);
-		glRenderbufferStorage(GL_RENDERBUFFER, depth_format, hw.w, hw.h);
 		glBindRenderbuffer(GL_RENDERBUFFER, 0);
 	}
 
+	// attachments first, storage after (legal in GLES2): the storage helper is the one resizes use too
 	glGenFramebuffers(1, &hw.fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, hw.fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hw.tex, 0);
 	if (hw.depth) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, hw.depth);
 	if (stencil)  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, hw.depth);
+	hw_allocStorage();
 
 	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status!=GL_FRAMEBUFFER_COMPLETE && hw.rgb565) {
+		printf("hw: RGB565 framebuffer incomplete (0x%x), back to RGBA8\n", status);
+		hw.rgb565 = 0;
+		hw_allocStorage();
+		status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	}
 	if (status!=GL_FRAMEBUFFER_COMPLETE) {
 		printf("hw: %ix%i framebuffer incomplete (0x%x)\n", hw.w, hw.h, status);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1358,28 +1398,72 @@ unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_l
 		return 0;
 	}
 
-	// so a repeat before the core's first frame shows black, not garbage
-	glViewport(0, 0, hw.w, hw.h);
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
 	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &hw.max_attribs);
 	// eglGetProcAddress only resolves extensions on this driver, which is
 	// what this is; SDL's falls back to the library for core functions too
 	if (strstr(exts, "GL_OES_vertex_array_object"))
 		hw.bind_vao = (PFNGLBINDVERTEXARRAYOESPROC)SDL_GL_GetProcAddress("glBindVertexArrayOES");
+	// only worth a call when there is depth/stencil to drop
+	if (hw.depth && strstr(exts, "GL_EXT_discard_framebuffer"))
+		hw.discard = (PFNGLDISCARDFRAMEBUFFEREXTPROC)SDL_GL_GetProcAddress("glDiscardFramebufferEXT");
 
 	hw.bottom_left = bottom_left;
 	hw.sw_tex = vid.game_tex;
 	PLAT_hwPresent(1);
 	PLAT_hwRestoreState();
 
-	printf("hw: fbo %u %ix%i RGBA8 + %s, %i vertex attribs, vao %s\n", hw.fbo, hw.w, hw.h,
+	printf("hw: fbo %u %ix%i %s + %s, %i vertex attribs, vao %s, discard %s\n", hw.fbo, hw.w, hw.h,
+	       hw.rgb565 ? "RGB565" : "RGBA8",
 	       depth_format==GL_DEPTH24_STENCIL8_OES ? "D24S8" :
 	       depth_format==GL_DEPTH_COMPONENT24_OES ? "D24" :
 	       depth_format ? "D16" : "no depth",
-	       hw.max_attribs, hw.bind_vao ? "yes" : "no");
+	       hw.max_attribs, hw.bind_vao ? "yes" : "no", hw.discard ? "yes" : "no");
 	return hw.fbo;
+}
+
+/**
+ * @brief Resizes the FBO's storage, keeping the FBO, texture and renderbuffer names.
+ *
+ * The previous contents are lost (cleared to black). The caller re-selects the scaler, which rebuilds the
+ * game quad for the new texture size (PLAT_getScaler marks it dirty).
+ *
+ * @param width  New width in pixels (clamped to the driver's limit).
+ * @param height New height in pixels (clamped to the driver's limit).
+ * @return 1 if the size changed, 0 if it already was that size or there is no FBO.
+ */
+int PLAT_hwResize(int width, int height) {
+	if (!hw.fbo || width<=0 || height<=0) return 0;
+	width  = MIN(width,  hw.max_size);
+	height = MIN(height, hw.max_size);
+	if (width==hw.w && height==hw.h) return 0;
+	printf("hw: fbo %ix%i -> %ix%i\n", hw.w, hw.h, width, height);
+	hw.w = width;
+	hw.h = height;
+	hw_allocStorage();
+	PLAT_hwRestoreState();
+	return 1;
+}
+
+/**
+ * @brief Called once per new hardware frame, right after the core finished drawing it.
+ *
+ * Tells the driver the depth/stencil contents are dead, so the SGX doesn't write them back to RAM when it
+ * resolves the tiles (640x480 D24S8 = 1.2 MB a frame). Cores clear depth at the start of every frame.
+ * Leaves hw.fbo bound: the caller restores the compositor's state next.
+ */
+void PLAT_hwFrameDone(void) {
+	if (!hw.discard) return;
+	static const GLenum depth_only[1] = { GL_DEPTH_ATTACHMENT };
+	static const GLenum depth_stencil[2] = { GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT };
+	glBindFramebuffer(GL_FRAMEBUFFER, hw.fbo);
+	if (hw.stencil) hw.discard(GL_FRAMEBUFFER, 2, depth_stencil);
+	else hw.discard(GL_FRAMEBUFFER, 1, depth_only);
+}
+
+/** @brief The FBO's allocated size (0x0 without one), for minarch's sizing decisions. */
+void PLAT_hwGetSize(int* width, int* height) {
+	*width = hw.w;
+	*height = hw.h;
 }
 
 void PLAT_hwQuit(void) {
