@@ -1,0 +1,325 @@
+From 0df4345eab43d0ddd5c05fe42e631d8fb6586b7e Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Wed, 25 Nov 2026 09:01:01 +0100
+Subject: [PATCH] atc260x_cap_gauge: port the installed vendor gauge build,
+ safe to build in
+
+The installed atc260x_cap_gauge.ko is a newer vendor build than the tree's source. Recovered from its
+disassembly (same instructions per function, .rodata/.data byte-identical):
+- battery temperature reader for the charger (act260x_set_get_temp_point): DTS support_battery_temperature
+  and bat_temp_channel (default REMCON), ADC -> C table; off on the RG35XX DTS (reads -1000, ignored)
+- full_power_schedule: the charger is stopped for the OCV check only at the taper voltage
+- notcharging_process: OCV always measured; shown full with OCV < 4150 mV -> 99% so the charger tops up
+- calc_charge_resistor: on a failed measurement restore the charge current / turn the charger back on;
+  the low-current branch no longer sets the current
+- get_responding_ocv: ocv_finded starts at 0; log lines re-enabled
+Built in: late_initcall_sync (after the charger's late_initcall, whose hooks drop callbacks before its
+probe) and no THIS_MODULE dereference.
+---
+ drivers/power/atc260x_cap_gauge.c | 150 +++++++++++++++++++++++++++---
+ 1 file changed, 136 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/power/atc260x_cap_gauge.c b/drivers/power/atc260x_cap_gauge.c
+index 37b9636e..6efc6252 100755
+--- a/drivers/power/atc260x_cap_gauge.c
++++ b/drivers/power/atc260x_cap_gauge.c
+@@ -156,6 +156,8 @@ struct dts_config_items
+ 	int shutdown_current;
+ 	int print_switch;
+ 	int log_switch;
++	int bat_temp_channel;
++	int support_battery_temperature;
+ 
+ 	int ocv_soc_config;
+ };
+@@ -277,6 +279,7 @@ struct atc260x_gauge_info
+ extern void act260x_set_get_cap_point(void *ptr);
+ extern void act260x_set_get_volt_point(void *ptr);
+ extern void act260x_set_get_cur_point(void *ptr);
++extern void act260x_set_get_temp_point(void *ptr);
+ 
+ extern int atc260x_set_charger_current(int new, int *old);
+ extern void atc260x_charger_turn_off_force(void);
+@@ -704,6 +707,19 @@ static int  get_cfg_items(struct atc260x_gauge_info *info)
+ 		GAUGE_WARNING("cfg_items.log_switch not config\n");
+ 	}
+ 
++	property = of_get_property(info->node, "support_battery_temperature", &len);
++	if (property && len == sizeof(int))
++	{
++		info->cfg_items.support_battery_temperature = be32_to_cpup(property);
++		GAUGE_WARNING("cfg_items.support_battery_temperature =%d\n",
++			info->cfg_items.support_battery_temperature);
++	}
++	else
++	{
++		info->cfg_items.support_battery_temperature = 0;
++		GAUGE_WARNING("cfg_items.support_battery_temperature not config\n");
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1053,7 +1069,7 @@ static int get_responding_ocv(struct atc260x_gauge_info *info,int soc)
+ {
+ 	int i;
+ 	int count;
+-	int ocv_finded;
++	int ocv_finded = 0;
+ 	int soc_finded;
+ 	int ocv_add;
+ 	int (*ocv_soc_table_p)[2];
+@@ -1530,6 +1546,8 @@ static int calc_charge_resistor(struct atc260x_gauge_info *info)
+ 		if (ret)
+ 		{
+ 			GAUGE_ERR("[%s]filter_process failed!\n",__func__);
++			/* RG35XX (vendor gauge): never leave the test current set */
++			atc260x_set_charger_current(reg_chg_current, &ret);
+ 			goto out;
+ 		}
+ 
+@@ -1542,6 +1560,7 @@ static int calc_charge_resistor(struct atc260x_gauge_info *info)
+ 		if (ret)
+ 		{
+ 			GAUGE_ERR("[%s]filter_process failed!\n",__func__);
++			atc260x_set_charger_current(reg_chg_current, &ret);
+ 			goto out;
+ 		}
+ 
+@@ -1550,7 +1569,7 @@ static int calc_charge_resistor(struct atc260x_gauge_info *info)
+ 	}
+ 	else
+ 	{
+-		reg_chg_current = get_chg_current_now();
++		/* RG35XX (vendor gauge): the charge current is not touched here, only the charger switched */
+ 		gather_battery_info(info);
+ 		ret = filter_process(info);
+ 		GAUGE_DBG("[%s]turn off charger!\n",__func__);
+@@ -1563,10 +1582,11 @@ static int calc_charge_resistor(struct atc260x_gauge_info *info)
+ 		if (ret)
+ 		{
+ 			GAUGE_ERR("[%s]filter_process failed!\n",__func__);
++			/* RG35XX (vendor gauge): never leave the charger forced off */
++			atc260x_charger_turn_on_force();
+ 			goto out;
+ 		}
+ 
+-		atc260x_set_charger_current(reg_chg_current, &ret);
+ 		GAUGE_DBG("[%s]turn on charger!\n",__func__);
+ 		atc260x_charger_turn_on_force();
+ 		msleep(500);
+@@ -1863,7 +1883,9 @@ static void soc_now_compensation(struct atc260x_gauge_info *info)
+ 
+ static void full_power_schedule(struct atc260x_gauge_info *info)
+ {
+-	if(atc260x_get_charge_status())
++	/* RG35XX (vendor gauge): stop the charger for the OCV check only once the battery is at the taper voltage */
++	info->vbatt_avg = measure_vbatt_average();
++	if(atc260x_get_charge_status() && info->vbatt_avg >= info->cfg_items.taper_vol)
+ 	{
+ 		atc260x_charger_turn_off_force();
+ 		GAUGE_DBG("[%s]now turn off charger...\n",__func__);
+@@ -1871,10 +1893,9 @@ static void full_power_schedule(struct atc260x_gauge_info *info)
+ 	}
+ 	/* detecting battery voltage as ocv*/
+ 	get_charge_status(&info->status);/* added by cxj @2015-01-28*/
+-	info->vbatt_avg = measure_vbatt_average();
+-	info->ocv = info->vbatt_avg;
++	info->ocv = measure_vbatt_average();
+ 	calc_soc(info, info->ocv, &info->soc_real);
+-	GAUGE_DBG("after 5 secs,bat_vol(ocv)= %d\n",info->vbatt_avg);	
++	GAUGE_DBG("after 5 secs,bat_vol(ocv)= %d\n",info->ocv);
+ 
+ 	if(info->soc_real == FULL_CHARGE_SOC)
+ 	{
+@@ -1882,7 +1903,7 @@ static void full_power_schedule(struct atc260x_gauge_info *info)
+ 		info->soc_real = FULL_CHARGE_SOC - 1000;
+ 	}
+ 
+-	if (info->vbatt_avg >= (info->cfg_items.taper_vol))
++	if (info->ocv >= (info->cfg_items.taper_vol))
+ 	{
+ 		taper_interval += info->interval;
+ 		GAUGE_DBG("[%s]taper_interval = %d\n",__func__,taper_interval);
+@@ -2032,7 +2053,10 @@ static int  charge_process(struct atc260x_gauge_info *info)
+ 		}
+ 		current_set_now = get_chg_current_now();
+ 		if (current_set_now != 100)
++		{
++			GAUGE_INFO("bat soc_real is full, set current 100MA\n");
+ 			atc260x_set_charger_current(100,&chg_current);
++		}
+ 		soc_grow_up(info,500);
+ 		return 0;
+ 	}	
+@@ -2041,6 +2065,11 @@ static int  charge_process(struct atc260x_gauge_info *info)
+ 	 */
+ 	if(pre_full_power_schedule(info))
+ 	{	
++		if (info->cfg_items.log_switch)
++		{
++			gather_battery_info(info);
++			calc_ocv(info);//calc batv,bati,ocv for log
++		}
+ 		info-> interval = 5;
+ 		if (emphasize_dealing(info))
+ 			full_power_schedule(info);
+@@ -2140,18 +2169,19 @@ static int notcharging_process(struct atc260x_gauge_info *info)
+ 	 * soc_now >0:avoid poor healthy status of battery,such as no battery ,short circuit.
+ 	 * soc_now <FULL_CHARGE_SOC:avoid still stepping into full power dealing when capacity is 100%,
+ 	 */
++	gather_battery_info(info);
++	calc_ocv(info);
+ 	if(info->soc_now == FULL_CHARGE_SOC || info->soc_now <= 0)
+ 	{
+-		if (info->cfg_items.log_switch)
++		/* RG35XX (vendor gauge): shown full but the battery sagged on external power: recharge */
++		if (info->soc_now == FULL_CHARGE_SOC && info->ocv < 4150)
+ 		{
+-			gather_battery_info(info);
+-			calc_ocv(info);//calc batv,bati,ocv for log
++			info->soc_now = FULL_CHARGE_SOC - 1000;
++			printk("====ocv=%d, rechaging=======\n", info->ocv);
+ 		}
+ 		return 0;
+ 	}
+ 
+-	gather_battery_info(info);
+-	calc_ocv(info);
+ 	calc_soc(info, info->ocv, &info->soc_real);  
+ 	/* 1.when the load capacity of adapter cannot support charging with more than 60mA,
+ 	 * 2.when full_power_dealing finished,and then turn on charger ,but also,the load capacity is not enough,
+@@ -2605,7 +2635,7 @@ static void gauge_update(struct work_struct *work)
+ 	get_charge_status(&info->status);
+ 	if (charge_status ^ info->status)
+ 	{
+-//		GAUGE_INFO("charge status changed!\n");//remove by bill
++		GAUGE_INFO("charge status changed!\n");
+ 		start_anew(info);  
+ 		if (info->status == POWER_SUPPLY_STATUS_DISCHARGING)
+ 			update_discharge_resistor(info,info->soc_now);
+@@ -2694,11 +2724,68 @@ int get_cap_gauge(void)
+ 	return global_gauge_info_ptr->soc_show;
+ }
+ 
++/* REMCON ADC value -> battery temperature: entry i is the lowest ADC value at (i - 30) C, -30..70 C */
++static const int remcon_adc_temp[101] = {
++	981, 977, 972, 968, 963, 959, 954, 949, 943, 938, 932, 926, 920, 914, 908, 901, 894, 887, 880, 873,
++	865, 858, 850, 842, 834, 825, 817, 808, 799, 790, 781, 772, 762, 753, 743, 734, 724, 714, 704, 694,
++	683, 673, 663, 653, 642, 632, 622, 611, 601, 590, 580, 570, 559, 549, 539, 529, 518, 508, 498, 489,
++	479, 469, 459, 450, 441, 431, 422, 413, 404, 395, 387, 378, 370, 361, 353, 345, 337, 330, 322, 315,
++	307, 300, 293, 286, 279, 273, 266, 260, 254, 248, 242, 236, 230, 225, 219, 214, 209, 204, 199, 194,
++	189,
++};
++
++/**
++ * @brief Battery temperature for the charger (act260x_set_get_temp_point), recovered from the installed vendor
++ *        gauge: 5 reads of the bat_temp_channel ADC, minimum and maximum dropped, the mean of the other 3 looked up
++ *        in remcon_adc_temp.
++ * @return The temperature in C (-30..71), or -1000 when support_battery_temperature is off or the ADC fails or
++ *         is out of range (the charger ignores readings below -100 C).
++ */
++static int get_battery_temperature(void)
++{
++	struct atc260x_gauge_info *info = global_gauge_info_ptr;
++	int sum = 0, max = 0, min = 1024;
++	int adc, temp, i;
++
++	if (!info->cfg_items.support_battery_temperature)
++		return -1000;
++	for (i = 0; i < 5; i++)
++	{
++		if (atc260x_auxadc_get_translated(info->atc260x, info->cfg_items.bat_temp_channel, &adc))
++		{
++			GAUGE_ERR("get icm translated fail!!\n");
++			return -1000;
++		}
++		sum += adc;
++		if (adc > max)
++			max = adc;
++		if (adc <= min)
++			min = adc;
++	}
++	adc = (sum - min - max) / 3;
++	if (adc < 40 || adc > 1000)
++	{
++		GAUGE_INFO("err,invalid adc=%d , pelase check bat temp sensor\n", adc);
++		return -1000;
++	}
++	if (adc > 980)
++		temp = -30;
++	else
++	{
++		for (i = 1; i < 101 && adc < remcon_adc_temp[i]; i++)
++			;
++		temp = i - 30;
++	}
++	GAUGE_INFO("adc=%d ,temp=%d C\n", adc, temp);
++	return temp;
++}
++
+ static void set_callback(void)
+ {
+ 	act260x_set_get_cap_point((void *)get_cap_gauge);
+ 	act260x_set_get_volt_point((void *)measure_vbatt);
+ 	act260x_set_get_cur_point((void *)measure_current);
++	act260x_set_get_temp_point((void *)get_battery_temperature);
+ }
+ 
+ void gauge_reset(struct atc260x_gauge_info *info)
+@@ -3047,6 +3134,28 @@ static  int atc260x_gauge_probe(struct platform_device *pdev)
+ 	register_early_suspend(&info->early_suspend);
+ #endif
+ 
++	if (info->cfg_items.support_battery_temperature)
++	{
++		const char *chan;
++
++		ret = of_property_read_string(info->node, "bat_temp_channel", &chan);
++		if (ret >= 0)
++		{
++			info->cfg_items.bat_temp_channel = atc260x_auxadc_find_chan(info->atc260x, chan);
++			GAUGE_INFO("bat_temp_channel: use %s\n", chan);
++		}
++		else
++		{
++			info->cfg_items.bat_temp_channel = atc260x_auxadc_find_chan(info->atc260x, "REMCON");
++			GAUGE_INFO("bat_temp_channel: use defualt REMCON\n");
++		}
++		if (info->cfg_items.bat_temp_channel < 0)
++		{
++			info->cfg_items.support_battery_temperature = 0;
++			GAUGE_WARNING("bat_temp_channel cfg err!\n");
++		}
++	}
++
+ 	/*Create a work queue for fuel gauge*/
+ 	info->wq =
+ 		create_singlethread_workqueue("atc260x_gauge_wq");
+@@ -3139,10 +3248,23 @@ static struct platform_driver atc260x_gauge_driver = {
+ static int __init atc260x_gauge_init(void)
+ {
+ 	GAUGE_INFO("========This is a new reconstructed gauge by actions==========\n");
++#ifdef MODULE
+ 	GAUGE_INFO("[%s] drv name:%s, drv version:%s\n", __func__, THIS_MODULE->name, THIS_MODULE->version);
++#else
++	/* built in, THIS_MODULE is NULL */
++	GAUGE_INFO("[%s] drv name:%s (built in)\n", __func__, KBUILD_MODNAME);
++#endif
+ 	return platform_driver_register(&atc260x_gauge_driver);
+ }
++/*
++ * RG35XX: built in, register after the charger (atc260x_power, late_initcall): its act260x_set_get_*_point()
++ * hooks drop the callbacks while global_power_dev is NULL.
++ */
++#ifdef MODULE
+ module_init(atc260x_gauge_init);
++#else
++late_initcall_sync(atc260x_gauge_init);
++#endif
+ 
+ static void __exit atc260x_gauge_exit(void)
+ {
+-- 
+2.53.0
+

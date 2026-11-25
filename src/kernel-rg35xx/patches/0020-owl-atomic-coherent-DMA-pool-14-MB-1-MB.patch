@@ -1,0 +1,35 @@
+From eb754ae20b252b982626f4ec78150ab6fc7a5050 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 23:06:54 +0100
+Subject: [PATCH 1/2] owl: atomic coherent DMA pool 14 MB -> 1 MB
+
+owl_map_io() sized the atomic (non-sleeping) coherent pool at 14 MB; it is carved out of CMA at boot and
+stays pinned. On the RG35XX nothing allocated from it after boot, MinUI, a game with sound, adb and an
+HDMI hotplug (atomic_pool_peak_pages = 0, patch 0019). Keep 1 MB, 4x the kernel default; an overflow is
+logged by the kernel ("atomic DMA coherent pool is too small").
+---
+ arch/arm/mach-owl/cpu-owl.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/mach-owl/cpu-owl.c b/arch/arm/mach-owl/cpu-owl.c
+index bfe67333..04da5532 100755
+--- a/arch/arm/mach-owl/cpu-owl.c
++++ b/arch/arm/mach-owl/cpu-owl.c
+@@ -62,8 +62,12 @@ EXPORT_SYMBOL(cpu_package);
+ 
+ void __init owl_map_io(void)
+ {
+-	/* dma coherent allocate buffer: 2 ~ 14MB */
+-	init_dma_coherent_pool_size(14 << 20);
++	/*
++	 * dma coherent allocate buffer for atomic (non-sleeping) allocations. The vendor set 14 MB, carved out of
++	 * CMA at boot and pinned for good; on the RG35XX nothing used any of it after boot, MinUI, a game with
++	 * sound, adb and an HDMI hotplug (dma_mapping.atomic_pool_peak_pages = 0). 1 MB is 4x the kernel default.
++	 */
++	init_dma_coherent_pool_size(1 << 20);
+ 	iotable_init(owl_io_desc, ARRAY_SIZE(owl_io_desc));
+ }
+ 
+-- 
+2.53.0
+

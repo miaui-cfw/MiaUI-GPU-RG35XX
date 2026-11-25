@@ -1,0 +1,36 @@
+From dd620587932556502f77cbd2d02d3cd55fc4431e Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:16:06 +0100
+Subject: [PATCH] owl: CMA size from CONFIG_CMA_SIZE_MBYTES only, not from the
+ ION DT heap
+
+owl_reserve() raised the CMA area to the DT's dma_heap_size (32 MB) for the ION pmem heap; with
+CONFIG_CMA_SIZE_MBYTES=48 the area was 48 MB. Nothing opens /dev/ion on the RG35XX: CMA serves the two
+framebuffers (fb0 3.7 MB, HDMI fb1 7.4 MB, allocated 1 MB-aligned) and small coherent DMA buffers. CMA
+pages only take movable allocations, so an oversized area shrinks the room for GPU memory and slab.
+Let the config alone size it.
+---
+ arch/arm/mach-owl/common-owl.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/mach-owl/common-owl.c b/arch/arm/mach-owl/common-owl.c
+index dced0425..e38ca992 100755
+--- a/arch/arm/mach-owl/common-owl.c
++++ b/arch/arm/mach-owl/common-owl.c
+@@ -268,7 +268,12 @@ void __init owl_reserve(void)
+ 	owl_pdev_ion_data.heaps[1].base = 0;
+ 	owl_pdev_ion_data.heaps[1].size = 0; /* prevent ion_reserve() from diging */
+ 	owl_pdev_ion_data.heaps[1].priv = &(owl_pdev_ion_device.dev);
+-	dma_contiguous_set_global_reserve_size(owl_ion1_size); /* set size of the CMA global area */
++	/*
++	 * RG35XX: the CMA area is sized by CONFIG_CMA_SIZE_MBYTES alone. The DT's dma_heap_size (32 MB) is for the
++	 * ION "pmem" heap, which nothing opens on this console; CMA only serves the framebuffers (fb0 + HDMI fb1,
++	 * ~12 MB) and small dma_alloc_coherent buffers, and every CMA page is closed to unmovable allocations
++	 * (GPU memory, slab).
++	 */
+ #else /* no CMA */
+ 	phy_mem_end -= owl_ion1_size;
+ 	owl_ion1_start = phy_mem_end;
+-- 
+2.53.0
+

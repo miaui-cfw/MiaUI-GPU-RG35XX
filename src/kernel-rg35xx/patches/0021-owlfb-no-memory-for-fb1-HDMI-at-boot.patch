@@ -1,0 +1,38 @@
+From 5d36d329564d412bc734d49c109e59bcd2686394 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 23:06:55 +0100
+Subject: [PATCH 2/2] owlfb: no memory for fb1 (HDMI) at boot
+
+fb1 took 7200 KB of pinned CMA at boot for the HDMI output (1280x720x4, double buffered), but nothing in
+the RG35XX system enables the HDMI output or draws into fb1: the output stays off with a cable plugged in
+(switch/hdmi state 0). Leave fb1 empty at boot, as owlfb already supports (overlay disabled, fb info
+cleared); whatever needs it can size it at run time through /sys/class/graphics/fb1/size, which calls
+owlfb_realloc_fbmem().
+---
+ drivers/video/owl/fb/owlfb-main.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/owl/fb/owlfb-main.c b/drivers/video/owl/fb/owlfb-main.c
+index 7b40419a..56144e3f 100755
+--- a/drivers/video/owl/fb/owlfb-main.c
++++ b/drivers/video/owl/fb/owlfb-main.c
+@@ -1334,8 +1334,14 @@ static int owlfb_allocate_all_fbs(struct owlfb_device *fbdev)
+ 	int i, r;
+ 
+ 	for (i = 0; i < fbdev->num_fbs; i++) {
+-		/* RG35XX: sized from the panel instead of a 1920x1080 worst case */
+-		r = owlfb_alloc_fbmem_display(fbdev->fbs[i], i == 0 ? OWLFB_FB0_SCREENS : 1);
++		/*
++		 * RG35XX: sized from the panel instead of a 1920x1080 worst case. fb1 (the HDMI output, 7.2 MB of
++		 * pinned CMA) gets no memory at boot: nothing in the system enables the HDMI output or draws into fb1.
++		 * Whatever does one day sizes it at run time (/sys/class/graphics/fb1/size, owlfb_realloc_fbmem()).
++		 */
++		if (i > 0)
++			continue;
++		r = owlfb_alloc_fbmem_display(fbdev->fbs[i], OWLFB_FB0_SCREENS);
+ 		if (r)
+ 			return r;		
+ 	}
+-- 
+2.53.0
+

@@ -1,0 +1,41 @@
+From caf8396cc9face4189b3f7f6d10d31c7a61ee47c Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Wed, 25 Nov 2026 03:59:22 +0100
+Subject: [PATCH] pvr omaplfb: re-read the fbdev on every first DC open (16/32
+ bpp switch)
+
+ReInitDCinfo (the vendor's resolution-switch workaround) latched after the
+first open, so the GPU kept the boot pixel format and stride. Re-init on every
+first open, which services makes once per GPU session. Same change as the
+pvrsrvkm byte patch a9d32b08 (beq -> b at .text 0x1e9f4), now in source.
+---
+ .../dc_omapfb3_linux/omaplfb_displayclass.c         | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c b/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c
+index c97e2f96..8b98994c 100755
+--- a/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c
++++ b/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c
+@@ -1401,10 +1401,15 @@ ErrorRelSem:
+ OMAPLFB_ERROR ReInitDCinfo(OMAPLFB_DEVINFO *psDevInfo)
+ {
+ 	OMAPLFB_ERROR eError = OMAPLFB_OK;
+-	if(OMAPLFBAtomicBoolRead(&psDevInfo->sInitFBInfoFlag))
+-	{
+-		return OMAPLFB_OK;
+-	}
++	/*
++	 * RG35XX: re-read the fbdev on every first open, not only the first one
++	 * after load (sInitFBInfoFlag used to latch it). Services calls
++	 * OpenDCDevice only on its 0 -> 1 refcount, so this runs once per GPU
++	 * session: a process that switched fb0 between 16 and 32 bpp while nobody
++	 * had the GPU open (platform/fbdepth.h) gets the new format and stride.
++	 * OMAPLFBInitFBDev allocates nothing per call. The flag still records
++	 * that an init happened, for the de-init path.
++	 */
+ 	if(OMAPLFBInitFBDev(psDevInfo) != OMAPLFB_OK)
+ 	{
+ 		OMAPLFB_ERROR eError = PVRSRV_ERROR_INVALID_DEVICE;
+-- 
+2.53.0
+

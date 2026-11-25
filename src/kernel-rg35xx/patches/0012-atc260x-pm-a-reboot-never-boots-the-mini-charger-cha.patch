@@ -1,0 +1,145 @@
+From a5bf66f1de31359860552e60281b8fd71fd12db9 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 20:28:57 +0100
+Subject: [PATCH] atc260x pm: a reboot never boots the mini-charger
+ (charging-screen loop)
+
+PMIC scratch tag 3 (ATC2603C PMU_UV_INT_EN bit 0) is read by the RG35XX
+bootloader as "low_power_boot_choice": with a cable in, a set flag (or a
+cable-insertion wake-up) makes it boot the mini-charger (the charging screen)
+and clear the flag. The public source named it DIS_MCHRG and set it on every
+normal reboot, so pressing Power on the charging screen (the charger binary
+reboots) went straight back to the charging screen while the cable was in.
+
+The console's original kernel (ctalon #40) names it EN_MCHRG and writes 0 on
+every reboot target; reboot to ADFU / recovery / bootloader / fastboot keeps
+its own flags. Renamed to EN_MCHRG and always cleared on reboot.
+---
+ drivers/mfd/atc260x-pm.c            | 36 +++++++++++------------------
+ drivers/mfd/atc260x-pstore.c        | 12 +++++-----
+ include/linux/mfd/atc260x/atc260x.h |  2 +-
+ 3 files changed, 21 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/mfd/atc260x-pm.c b/drivers/mfd/atc260x-pm.c
+index c75bfd80..6e25f61e 100755
+--- a/drivers/mfd/atc260x-pm.c
++++ b/drivers/mfd/atc260x-pm.c
+@@ -871,43 +871,35 @@ static int _atc260x_pm_reboot(uint tgt)
+ {
+ 	struct atc260x_pm_dev *atc260x_pm = _get_curr_atc260x_pm_obj();
+ 	struct atc260x_dev *atc260x = atc260x_pm->atc260x;
+-	uint flag_adfu, flag_recovery, flag_dis_mchrg;
++	uint flag_adfu, flag_recovery;
+ 	int ret;
+ 
+ 	dev_info(atc260x_pm->dev, "%s() enter, tgt=%u\n", __func__, tgt);
+ 
+-	flag_adfu = flag_recovery = flag_dis_mchrg = 0;
++	flag_adfu = flag_recovery = 0;
+ 	switch (tgt) {
+-	case OWL_PMIC_REBOOT_TGT_NORMAL:
+-		flag_adfu = flag_recovery = flag_dis_mchrg = 0;
+-		break;
+-	case OWL_PMIC_REBOOT_TGT_SYS:
+-		flag_adfu = flag_recovery = 0;
+-		flag_dis_mchrg = 1;
+-		break;
+ 	case OWL_PMIC_REBOOT_TGT_ADFU:
+-		flag_adfu = flag_dis_mchrg = 1;
+-		flag_recovery = 0;
++		flag_adfu = 1;
+ 		break;
+ 	case OWL_PMIC_REBOOT_TGT_RECOVERY:
+-		flag_recovery = flag_dis_mchrg = 1;
+-		flag_adfu = 0;
++		flag_recovery = 1;
+ 		break;
+ 	case OWL_PMIC_REBOOT_TGT_BOOTLOADER:
+ 		flag_recovery = 2;
+-		flag_dis_mchrg = 0;
+-		flag_adfu = 0;
+-		break;	
++		break;
+ 	case OWL_PMIC_REBOOT_TGT_FASTBOOT:
+ 		flag_recovery = 3;
+-		flag_dis_mchrg = 0;
+-		flag_adfu = 0;
+-		break;		
+-		
++		break;
+ 	}
+ 	ret = atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_REBOOT_ADFU, flag_adfu);
+ 	ret |= atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_REBOOT_RECOVERY, flag_recovery);
+-	ret |= atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_DIS_MCHRG, flag_dis_mchrg);
++	/*
++	 * The RG35XX bootloader boots the mini-charger (the charging screen) when a cable is in and this flag is set
++	 * (or the PMIC woke on a cable insertion). A reboot must never land there, so it is always cleared, as the
++	 * console's original kernel does; the public source set it ("DIS_MCHRG") on every normal reboot, so pressing
++	 * Power on the charging screen rebooted straight back into it while the cable was in.
++	 */
++	ret |= atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_EN_MCHRG, 0);
+ 	if (ret) {
+ 		dev_err(atc260x_pm->dev, "%s() failed to update pstore\n", __func__);
+ 		return -EIO;
+@@ -1284,7 +1276,7 @@ static void _clear_status(struct atc260x_pm_dev *atc260x_pm)
+ 	/* clear pstore */
+ 	ret = atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_REBOOT_ADFU, 0);
+ 	ret |= atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_REBOOT_RECOVERY, 0);
+-	ret |= atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_DIS_MCHRG, 0);
++	ret |= atc260x_pstore_set(atc260x, ATC260X_PSTORE_TAG_EN_MCHRG, 0);
+ 	if (ret) {
+ 		dev_err(atc260x_pm->dev, "%s() %u err\n", __func__, __LINE__);
+ 	}
+diff --git a/drivers/mfd/atc260x-pstore.c b/drivers/mfd/atc260x-pstore.c
+index 4d762568..5dec3156 100755
+--- a/drivers/mfd/atc260x-pstore.c
++++ b/drivers/mfd/atc260x-pstore.c
+@@ -48,8 +48,8 @@ static const struct atc260x_pstore_fmt sc_atc2603a_pstore_fmt_tbl[] = {
+ 		.src_bp = {0                     },
+ 	},
+ 
+-	[ATC260X_PSTORE_TAG_DIS_MCHRG] = {
+-		.name = "DIS_MCHRG",
++	[ATC260X_PSTORE_TAG_EN_MCHRG] = {
++		.name = "EN_MCHRG",
+ 		.regs   = {ATC2603A_PMU_UV_INT_EN },
+ 		.reg_bm = {(1U << 0)              },
+ 		.src_bp = {0                      },
+@@ -148,8 +148,8 @@ static const struct atc260x_pstore_fmt sc_atc2603c_pstore_fmt_tbl[] = {
+ 		.src_bp = {0                     },
+ 	},
+ 
+-	[ATC260X_PSTORE_TAG_DIS_MCHRG] = {
+-		.name = "DIS_MCHRG",
++	[ATC260X_PSTORE_TAG_EN_MCHRG] = {
++		.name = "EN_MCHRG",
+ 		.regs   = {ATC2603C_PMU_UV_INT_EN },
+ 		.reg_bm = {(1U << 0)              },
+ 		.src_bp = {0                      },
+@@ -248,8 +248,8 @@ static const struct atc260x_pstore_fmt sc_atc2609a_pstore_fmt_tbl[] = {
+ 		.src_bp = {0                     },
+ 	},
+ 
+-	[ATC260X_PSTORE_TAG_DIS_MCHRG] = {
+-		.name = "DIS_MCHRG",
++	[ATC260X_PSTORE_TAG_EN_MCHRG] = {
++		.name = "EN_MCHRG",
+ 		.regs   = {ATC2609A_PMU_UV_INT_EN },
+ 		.reg_bm = {(1U << 0)              },
+ 		.src_bp = {0                      },
+diff --git a/include/linux/mfd/atc260x/atc260x.h b/include/linux/mfd/atc260x/atc260x.h
+index 85a0ba58..ed9a0b35 100755
+--- a/include/linux/mfd/atc260x/atc260x.h
++++ b/include/linux/mfd/atc260x/atc260x.h
+@@ -191,7 +191,7 @@ enum {
+ 	ATC260X_PSTORE_TAG_REBOOT_ADFU = 0,     /* 重启进ADFU标志. */
+ 	ATC260X_PSTORE_TAG_REBOOT_RECOVERY,     /* 重启进recovery标志. */
+ 	ATC260X_PSTORE_TAG_FW_S2,               /* 软件S2标志 */
+-	ATC260X_PSTORE_TAG_DIS_MCHRG,           /* 重启不进mini_charger */
++	ATC260X_PSTORE_TAG_EN_MCHRG,            /* 1: boot the mini-charger (RG35XX bootloader: with a cable in, the next boot goes to the charging screen; the bootloader clears it). The public source named it DIS_MCHRG and set it on reboot: the charger reboot loop. */
+ 	ATC260X_PSTORE_TAG_RTC_MSALM,           /* RTC Alarm 备份区, reboot/suspend会用到. */
+ 	ATC260X_PSTORE_TAG_RTC_HALM,            /* RTC Alarm 备份区 */
+ 	ATC260X_PSTORE_TAG_RTC_YMDALM,          /* RTC Alarm 备份区 */
+-- 
+2.53.0
+

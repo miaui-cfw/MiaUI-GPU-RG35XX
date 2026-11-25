@@ -1,0 +1,43 @@
+From e5f061ceb130fc5f294e8416175452c9cc6bff39 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:16:48 +0100
+Subject: [PATCH] fs: exfat behind CONFIG_EXFAT_FS (default y)
+
+fs/Makefile built the vendor exFAT driver unconditionally (obj-y, ~67 KB). Put it behind a bool option
+that defaults to y, so existing configs keep it and the RG35XX gaming config can leave it out.
+---
+ fs/Kconfig  | 7 +++++++
+ fs/Makefile | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 2092da8c..ee5f65ca 100755
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -92,6 +92,13 @@ if BLOCK
+ menu "DOS/FAT/NT Filesystems"
+ 
+ source "fs/fat/Kconfig"
++config EXFAT_FS
++	bool "exFAT file system support (vendor driver)"
++	default y
++	help
++	  The vendor exFAT driver in fs/exfat, which used to be built unconditionally.
++	  Say N on systems that never mount exFAT volumes.
++
+ source "fs/ntfs/Kconfig"
+ 
+ endmenu
+diff --git a/fs/Makefile b/fs/Makefile
+index b021e2b0..fd99ebcf 100755
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -126,4 +126,4 @@ obj-y				+= exofs/ # Multiple modules
+ obj-$(CONFIG_CEPH_FS)		+= ceph/
+ obj-$(CONFIG_PSTORE)		+= pstore/
+ obj-$(CONFIG_EFIVAR_FS)		+= efivarfs/
+-obj-y		+= exfat/
++obj-$(CONFIG_EXFAT_FS)	+= exfat/
+-- 
+2.53.0
+

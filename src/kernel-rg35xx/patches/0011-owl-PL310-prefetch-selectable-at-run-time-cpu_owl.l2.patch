@@ -1,0 +1,117 @@
+From 9c3dcbe795198d6c9df71b26d64b02767929f136 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 19:27:38 +0100
+Subject: [PATCH] owl: PL310 prefetch selectable at run time
+ (cpu_owl.l2_prefetch, whitelisted)
+
+/sys/module/cpu_owl/parameters/l2_prefetch or cpu_owl.l2_prefetch= on the command line:
+default (0x78800002, the vendor value and still the default), nodpf, nodlf, none. A run-time write
+also updates l2x0_saved_regs so a resume keeps it. Measured on the RG35XX display FIFO underflow
+reproducer (AITD2 pre-fix build, 3 x 60 s at 1.2 GHz): default 18, nodpf 2, nodlf 0, none 4
+underflows; Game Boy core CPU time +0 / +2.3 / +6.9 / +7.4%.
+---
+ arch/arm/mach-owl/cpu-owl.c | 74 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/mach-owl/cpu-owl.c b/arch/arm/mach-owl/cpu-owl.c
+index 7d0e4e3f..bfe67333 100755
+--- a/arch/arm/mach-owl/cpu-owl.c
++++ b/arch/arm/mach-owl/cpu-owl.c
+@@ -88,6 +88,77 @@ void __init owl_init_irq(void)
+ }
+ 
+ #ifdef CONFIG_CACHE_L2X0
++/*
++ * PL310 Prefetch Control, selectable at run time (RG35XX display FIFO underflow work):
++ * /sys/module/cpu_owl/parameters/l2_prefetch, or cpu_owl.l2_prefetch=NAME on the kernel command line.
++ * Reading gives "NAME 0xVALUE" of the live register. Only the values below are accepted, by name or by value.
++ * Measured 2026-11-24 at 1.2 GHz: AITD2 pre-fix build underflows per 3 min / Game Boy core CPU time.
++ */
++static const struct {
++	const char *name;
++	u32 val;
++} owl_l2_prefetch_modes[] = {
++	{ "default", 0x78800002 },	/* vendor: double linefill + incr DLF + I/D prefetch, offset 2: 18 / +0% */
++	{ "nodpf",   0x68800002 },	/* no data prefetch: 2 / +2.3% */
++	{ "nodlf",   0x38000002 },	/* no double linefill, no incr double linefill: 0 / +6.9% */
++	{ "none",    0x28000002 },	/* instruction prefetch only: 4 / +7.4% */
++};
++static u32 owl_l2_prefetch = 0x78800002;
++static bool owl_l2_ready;	/* the L2 is initialised: writes go to the register */
++
++/**
++ * owl_l2_prefetch_set - selects a Prefetch Control value from owl_l2_prefetch_modes
++ * @arg: a mode name or its exact value ("0x38000002")
++ * @kp: unused
++ *
++ * Before the L2 is initialised (command line) the value is only stored; owl_l2x0_init writes it. After, the register
++ * is written and l2x0_saved_regs updated, so a resume restores the selected value, not the boot one.
++ * Returns 0, or -EINVAL for anything not in the table.
++ */
++static int owl_l2_prefetch_set(const char *arg, const struct kernel_param *kp)
++{
++	u32 val;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(owl_l2_prefetch_modes); i++)
++		if (sysfs_streq(arg, owl_l2_prefetch_modes[i].name) ||
++		    (kstrtou32(arg, 0, &val) == 0 && val == owl_l2_prefetch_modes[i].val))
++			break;
++	if (i == ARRAY_SIZE(owl_l2_prefetch_modes))
++		return -EINVAL;
++	owl_l2_prefetch = owl_l2_prefetch_modes[i].val;
++	if (owl_l2_ready) {
++		act_writel(owl_l2_prefetch, (unsigned int)OWL_PA_L2CC + L2X0_PREFETCH_CTRL);
++		l2x0_saved_regs.prefetch_ctrl = owl_l2_prefetch;
++	}
++	pr_info("l2_prefetch: %s (0x%08x)\n", owl_l2_prefetch_modes[i].name, owl_l2_prefetch);
++	return 0;
++}
++
++/**
++ * owl_l2_prefetch_get - prints the live Prefetch Control register and its mode name ("?" if not in the table)
++ * @buf: output
++ * @kp: unused
++ */
++static int owl_l2_prefetch_get(char *buf, const struct kernel_param *kp)
++{
++	u32 val = owl_l2_ready ? act_readl((unsigned int)OWL_PA_L2CC + L2X0_PREFETCH_CTRL) : owl_l2_prefetch;
++	const char *name = "?";
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(owl_l2_prefetch_modes); i++)
++		if (owl_l2_prefetch_modes[i].val == val)
++			name = owl_l2_prefetch_modes[i].name;
++	return sprintf(buf, "%s 0x%08x\n", name, val);
++}
++
++static struct kernel_param_ops owl_l2_prefetch_ops = {
++	.set = owl_l2_prefetch_set,
++	.get = owl_l2_prefetch_get,
++};
++module_param_cb(l2_prefetch, &owl_l2_prefetch_ops, NULL, 0644);
++MODULE_PARM_DESC(l2_prefetch, "PL310 prefetch: default, nodpf, nodlf or none");
++
+ static int __init owl_l2x0_init(void)
+ {
+ 	void __iomem *l2x0_base;
+@@ -98,7 +169,7 @@ static int __init owl_l2x0_init(void)
+ 	l2x0_base = (void *)IO_ADDRESS(OWL_PA_L2CC);
+ 
+ 	/* config l2c310 */
+-	act_writel(0x78800002, (unsigned int)OWL_PA_L2CC + L2X0_PREFETCH_CTRL);
++	act_writel(owl_l2_prefetch, (unsigned int)OWL_PA_L2CC + L2X0_PREFETCH_CTRL);	/* l2_prefetch, default 0x78800002 */
+ 	act_writel(L2X0_DYNAMIC_CLK_GATING_EN | L2X0_STNDBY_MODE_EN,
+ 		(unsigned int)OWL_PA_L2CC + L2X0_POWER_CTRL);
+ 
+@@ -122,6 +193,7 @@ static int __init owl_l2x0_init(void)
+ #else
+ 	l2x0_init(l2x0_base, val, L2X0_AUX_CTRL_MASK);
+ #endif
++	owl_l2_ready = true;
+ 
+ 	return 0;
+ }
+-- 
+2.53.0
+

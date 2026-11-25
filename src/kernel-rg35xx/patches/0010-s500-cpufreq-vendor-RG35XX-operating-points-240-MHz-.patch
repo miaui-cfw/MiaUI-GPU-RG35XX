@@ -1,0 +1,78 @@
+From 191df53685d6da01f0769a7c88a3ade5eb750a89 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 17:21:20 +0100
+Subject: [PATCH] s500 cpufreq: vendor RG35XX operating points (240 MHz - 1.488
+ GHz)
+
+The rg35xx-cfw tree capped cpu0_table at 900 MHz (the 1104 MHz entry commented out, 900 MHz listed twice).
+The kernel the console ships carries one 10-entry table, 1488/1392/1296/1200/1104/1008/840/720/504/240 MHz at
+1375/1325/1275/1200/1175/1100/1075/1025/1000/975 mV (the same as MinUI's overclock table), and logs the chip's
+bond option at init. Recovered by binary diff of owl_cpu0_cpufreq_driver_init and the table data in the console's
+uImage (a6da315d). MinUI sets its clocks through cpufreq scaling_max_freq, so with the capped table its 1.2 GHz
+game clock ran at 900 MHz. The CPU regulator (DT dcdc1) allows 0.7-1.4 V.
+---
+ drivers/cpufreq/s500-cpufreq.c | 32 +++++++++++++++++++++++++-------
+ 1 file changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/cpufreq/s500-cpufreq.c b/drivers/cpufreq/s500-cpufreq.c
+index b20d6121..0464f06a 100755
+--- a/drivers/cpufreq/s500-cpufreq.c
++++ b/drivers/cpufreq/s500-cpufreq.c
+@@ -24,6 +24,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/slab.h>
+ #include <linux/delay.h>
++#include <linux/io.h>
+ #include <linux/suspend.h>
+ #include <asm/cpu.h>
+ 
+@@ -47,15 +48,23 @@ static unsigned int locking_frequency;
+ static bool frequency_locked;
+ static DEFINE_MUTEX(freq_table_mux);
+ 
++/*
++ * RG35XX operating points, as in the vendor kernel the console ships (and MinUI's overclock table):
++ * 240 MHz - 1.488 GHz. The rg35xx-cfw tree capped the table at 900 MHz (two 900 MHz entries), so cpufreq
++ * clamped MinUI's 1.2 GHz game clock to 900 MHz.
++ */
+ static struct cpu0_opp_table cpu0_table[] = {
+ 	/*khz		uV*/
+-
+-//	{1104000, 1175000},
+-	{ 900000, 1025000},
+-	{ 900000, 1025000},
+-	{ 720000,  975000},
+-	{ 504000,  950000},
+-	{ 240000,  950000},
++	{1488000, 1375000},
++	{1392000, 1325000},
++	{1296000, 1275000},
++	{1200000, 1200000},
++	{1104000, 1175000},
++	{1008000, 1100000},
++	{ 840000, 1075000},
++	{ 720000, 1025000},
++	{ 504000, 1000000},
++	{ 240000,  975000},
+ };
+ 
+ struct device cpu0_dev;
+@@ -676,6 +685,15 @@ int owl_cpu0_cpufreq_driver_init(void)
+ 		CPUFREQ_ERR("failed to get cpu0 regulator\n");
+ 		cpu_reg = NULL;
+ 	}
++	{
++		/* the chip's bond option, logged as the vendor kernel does (information only) */
++		void __iomem *bond = ioremap(0xB01B00E0, 8);
++
++		if (bond) {
++			printk("cpufreq: bond_opt=%d\n", readl(bond) & 0xf);
++			iounmap(bond);
++		}
++	}
+ 
+ 	/*of_init_opp_table*/
+ 	init_cpu0_opp_info();
+-- 
+2.53.0
+

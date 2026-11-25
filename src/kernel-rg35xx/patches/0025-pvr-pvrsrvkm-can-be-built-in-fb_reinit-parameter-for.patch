@@ -1,0 +1,103 @@
+From 4396f46115c75304a2dc9b9fb6d4eb8e01ae73c7 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Wed, 25 Nov 2026 09:18:55 +0100
+Subject: [PATCH] pvr: pvrsrvkm can be built in; fb_reinit parameter for
+ fbdepth
+
+drivers/Makefile and drivers/gpu/Makefile descended into gpu/ and pvr/ for modules only and the DDK
+Makefile hardcoded obj-m: now obj-y descents and pvrsrvkm follows CONFIG_IMG_SGX_544_linux (bc_example,
+unused, only next to the module: it imports PVRGetBufferClassJTable). This DDK config
+(PVR_LDM_PLATFORM_PRE_REGISTERED, SUPPORT_DRI_DRM) compiles no MODULE-only paths. Built in,
+PVRSRVDrmInit runs at late_initcall_sync: the display class driver opens fb0 at init, which owlfb
+registers at late_initcall. A built-in driver has no /sys/module/pvrsrvkm/notes build-id for the
+fbdepth marker: read-only parameter /sys/module/pvrsrvkm/parameters/fb_reinit = 1 (present built in
+and as a module) instead.
+---
+ drivers/Makefile                                          | 3 ++-
+ drivers/gpu/Makefile                                      | 3 ++-
+ drivers/gpu/pvr/eurasia_km_linux/Makefile                 | 7 ++++++-
+ .../3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c      | 8 ++++++++
+ .../eurasia_km_linux/services4/srvkm/env/linux/pvr_drm.c  | 8 ++++++++
+ 5 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 5d359b7f..7536c7d8 100755
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -46,7 +46,8 @@ obj-y				+= tty/
+ obj-y				+= char/
+ 
+ # gpu/ comes after char for AGP vs DRM startup
+-obj-m				+= gpu/
++# RG35XX: obj-y so a built-in drm/pvrsrvkm is linked (the subdirectories follow their configs)
++obj-y				+= gpu/
+ 
+ obj-$(CONFIG_CONNECTOR)		+= connector/
+ 
+diff --git a/drivers/gpu/Makefile b/drivers/gpu/Makefile
+index 9af7ec63..2c4cb25c 100755
+--- a/drivers/gpu/Makefile
++++ b/drivers/gpu/Makefile
+@@ -1,3 +1,4 @@
+ obj-y			+= drm/ vga/ stub/
+ obj-$(CONFIG_TEGRA_HOST1X)	+= host1x/
+-obj-m += pvr/
++# RG35XX: pvr/ selects built in or module from CONFIG_IMG_SGX_544_linux
++obj-y += pvr/
+diff --git a/drivers/gpu/pvr/eurasia_km_linux/Makefile b/drivers/gpu/pvr/eurasia_km_linux/Makefile
+index 1b5f1678..2d940554 100755
+--- a/drivers/gpu/pvr/eurasia_km_linux/Makefile
++++ b/drivers/gpu/pvr/eurasia_km_linux/Makefile
+@@ -219,4 +219,9 @@ bc_example-objs += \
+ 	services4/3rdparty/bufferclass_example/bufferclass_example_private.o
+ 
+ 
+-obj-m += pvrsrvkm.o bc_example.o
++# RG35XX: pvrsrvkm built in or module per CONFIG_IMG_SGX_544_linux; bc_example (unused, it imports
++# PVRGetBufferClassJTable, exported only by the module) only next to the module
++obj-$(CONFIG_IMG_SGX_544_linux) += pvrsrvkm.o
++ifeq ($(CONFIG_IMG_SGX_544_linux),m)
++obj-m += bc_example.o
++endif
+diff --git a/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c b/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c
+index 8b98994c..96d69e1d 100755
+--- a/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c
++++ b/drivers/gpu/pvr/eurasia_km_linux/services4/3rdparty/dc_omapfb3_linux/omaplfb_displayclass.c
+@@ -99,6 +99,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ 
+ static OMAPLFB_DEVINFO *gapsDevInfo[OMAPLFB_MAX_NUM_DEVICES];
+ 
++/*
++ * RG35XX: /sys/module/pvrsrvkm/parameters/fb_reinit (read only, 1) tells userspace (platform/fbdepth.h)
++ * that ReInitDCinfo re-reads the fbdev, so fb0 may switch between 16 and 32 bpp with no GPU client.
++ * Built in there is no /sys/module/pvrsrvkm/notes build-id to carry the module's marker.
++ */
++static int fb_reinit = 1;
++module_param(fb_reinit, int, S_IRUGO);
++
+ /* Top level 'hook ptr' */
+ static PFN_DC_GET_PVRJTABLE gpfnGetPVRJTable = NULL;
+ 
+diff --git a/drivers/gpu/pvr/eurasia_km_linux/services4/srvkm/env/linux/pvr_drm.c b/drivers/gpu/pvr/eurasia_km_linux/services4/srvkm/env/linux/pvr_drm.c
+index 9c4d5ee8..3f47c8cd 100755
+--- a/drivers/gpu/pvr/eurasia_km_linux/services4/srvkm/env/linux/pvr_drm.c
++++ b/drivers/gpu/pvr/eurasia_km_linux/services4/srvkm/env/linux/pvr_drm.c
+@@ -788,7 +788,15 @@ static void __exit PVRSRVDrmExit(void)
+  * statically as well; in both cases they define the function the kernel will
+  * run to start/stop the driver.
+ */
++#if defined(MODULE)
+ module_init(PVRSRVDrmInit);
++#else
++/*
++ * RG35XX built in: after owlfb, which registers fb0 at late_initcall (the display class driver opens
++ * it at init), and after drm (module_init).
++ */
++late_initcall_sync(PVRSRVDrmInit);
++#endif
+ module_exit(PVRSRVDrmExit);
+ #endif	/* !defined(SUPPORT_DRI_DRM_EXT) */
+ #endif	/* defined(SUPPORT_DRI_DRM) */
+-- 
+2.53.0
+

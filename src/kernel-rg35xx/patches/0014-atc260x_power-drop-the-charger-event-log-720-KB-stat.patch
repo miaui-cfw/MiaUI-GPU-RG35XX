@@ -1,0 +1,52 @@
+From 39351daa059796b37656d9aa2ac753720fba2c10 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:15:16 +0100
+Subject: [PATCH 2/2] atc260x_power: drop the charger event log (720 KB static
+ buffer nobody reads)
+
+atc260x_power_event_log.c kept logbuf[30*48*512] in .bss and recorded charger events into it, but
+log_event_dump() is called nowhere, so the 720 KB were never read. The log_event_*() calls stay in the
+driver as inline no-ops and the file is no longer built.
+---
+ drivers/power/atc260x_power/Makefile        |  2 +-
+ drivers/power/atc260x_power/atc260x_power.h | 16 ++++++++++------
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/power/atc260x_power/Makefile b/drivers/power/atc260x_power/Makefile
+index aee57d39..53d298b0 100755
+--- a/drivers/power/atc260x_power/Makefile
++++ b/drivers/power/atc260x_power/Makefile
+@@ -1,2 +1,2 @@
+ obj-$(CONFIG_CHARGER_DRV_ATC206X) += atc260x_power.o
+-atc260x_power-y := atc260x_power_main.o atc2603a_power_phy.o atc2603c_power_phy.o atc260x_power_event_log.o
+\ No newline at end of file
++atc260x_power-y := atc260x_power_main.o atc2603a_power_phy.o atc2603c_power_phy.o
+\ No newline at end of file
+diff --git a/drivers/power/atc260x_power/atc260x_power.h b/drivers/power/atc260x_power/atc260x_power.h
+index efacd07f..d6ee5cae 100755
+--- a/drivers/power/atc260x_power/atc260x_power.h
++++ b/drivers/power/atc260x_power/atc260x_power.h
+@@ -293,10 +293,14 @@ void atc2603c_get_info(struct atc260x_charger *charger);
+ #define LOG_HEADER_CHARGER_ON "charge_on"
+ #define LOG_HEADER_CHARGER_OFF "charge_off"
+ 
+-extern int log_event_none(const char *header);
+-extern int log_event_int(const char *header, int intval);
+-extern int log_event_int_int(const char *header, int intval, int newval);
+-extern int log_event_string(const char *header, const char *content);
+-extern void log_event_dump(void);
+-extern void log_event_init(void);
++/*
++ * RG35XX: the charger event log (atc260x_power_event_log.c) kept a 720 KB static buffer that nothing ever
++ * read (log_event_dump() is not called anywhere). The calls stay in the driver as no-ops.
++ */
++static inline int log_event_none(const char *header) { return 0; }
++static inline int log_event_int(const char *header, int intval) { return 0; }
++static inline int log_event_int_int(const char *header, int intval, int newval) { return 0; }
++static inline int log_event_string(const char *header, const char *content) { return 0; }
++static inline void log_event_dump(void) { }
++static inline void log_event_init(void) { }
+ #endif
+-- 
+2.53.0
+

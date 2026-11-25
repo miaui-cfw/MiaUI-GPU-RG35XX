@@ -1,0 +1,84 @@
+From 6499cad0a7865ccc5464e09545442ff98b216ddf Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:24:27 +0100
+Subject: [PATCH] usb: android gadget: accessory function only with built-in
+ HID
+
+f_accessory.c (Android Open Accessory) calls the HID core directly, so a built-in android gadget could not
+be linked with HID as a module. Build the accessory function only when CONFIG_HID is built in: the RG35XX
+gaming config builds the whole external USB input stack as modules, and the console uses only the adb,
+rndis (usbnet) and mass-storage/MTP functions, never accessory mode.
+---
+ drivers/usb/gadget/android.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/gadget/android.c b/drivers/usb/gadget/android.c
+index 60a218f1..d4509678 100755
+--- a/drivers/usb/gadget/android.c
++++ b/drivers/usb/gadget/android.c
+@@ -35,7 +35,14 @@
+ #include "f_mass_storage.c"
+ #include "f_adb.c"
+ #include "f_mtp.c"
++/*
++ * RG35XX: the Android Open Accessory function calls the HID core directly; it is only built when HID is built in
++ * (the gaming config builds HID as a module for external controllers, and the console never uses accessory mode).
++ */
++#if IS_BUILTIN(CONFIG_HID)
++#define ANDROID_ACCESSORY 1
+ #include "f_accessory.c"
++#endif
+ #define USB_ETH_RNDIS y
+ #include "f_rndis.c"
+ #include "rndis.c"
+@@ -972,7 +979,7 @@ static struct android_usb_function mass_storage_function = {
+ 	.attributes	= mass_storage_function_attributes,
+ };
+ 
+-
++#ifdef ANDROID_ACCESSORY
+ static int accessory_function_init(struct android_usb_function *f,
+ 					struct usb_composite_dev *cdev)
+ {
+@@ -1004,6 +1011,7 @@ static struct android_usb_function accessory_function = {
+ 	.bind_config	= accessory_function_bind_config,
+ 	.ctrlrequest	= accessory_function_ctrlrequest,
+ };
++#endif
+ 
+ static int audio_source_function_init(struct android_usb_function *f,
+ 			struct usb_composite_dev *cdev)
+@@ -1075,7 +1083,9 @@ static struct android_usb_function *supported_functions[] = {
+ 	&ptp_function,
+ 	&rndis_function,
+ 	&mass_storage_function,
++#ifdef ANDROID_ACCESSORY
+ 	&accessory_function,
++#endif
+ 	&audio_source_function,
+ 	NULL
+ };
+@@ -1534,8 +1544,10 @@ android_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c)
+ 	/* Special case the accessory function.
+ 	 * It needs to handle control requests before it is enabled.
+ 	 */
++#ifdef ANDROID_ACCESSORY
+ 	if (value < 0)
+ 		value = acc_ctrlrequest(cdev, c);
++#endif
+ 
+ 	if (value < 0)
+ 		value = composite_setup_func(gadget, c);
+@@ -1563,7 +1575,9 @@ static void android_disconnect(struct usb_composite_dev *cdev)
+ 	   accessory function is not actually enabled,
+ 	   so we need to inform it when we are disconnected.
+ 	 */
++#ifdef ANDROID_ACCESSORY
+ 	acc_disconnect();
++#endif
+ 
+ 	dev->connected = 0;
+ 	schedule_work(&dev->work);
+-- 
+2.53.0
+

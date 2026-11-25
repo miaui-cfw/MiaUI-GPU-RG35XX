@@ -1,0 +1,41 @@
+From 10dc16102e67dbfdb0d01a22be386a2ec8343121 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:40:46 +0100
+Subject: [PATCH] atc260x pm: a long Power press switches a hung console off
+ (no RESET wake-up while running)
+
+Holding Power for 8 s makes the ATC2603C reset the whole system (PMU_SYS_CTL2 ONOFF_PRESS_Reset_EN,
+8 s with ONOFF_RESET_TIME_SEL=01), the only way out of a hang. The probe enabled the RESET wake-up source
+(PMU_SYS_CTL0 RESET_WK_EN) for the running system, so that reset also powered the console straight back
+on: a boot that hung came back after every forced restart. Leave RESET out of the running system's wake-up
+sources. The reboot path (_atc2603c_9a_pm_do_reboot) enables it itself before its software reset, and the
+power-off path (owl_pm_halt) keeps it with the ONOFF long-press wake-up, so normal power-on is unchanged.
+Register descriptions: ATC2603C datasheet v2.1, 7.4.1 and 7.4.3.
+---
+ drivers/mfd/atc260x-pm.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mfd/atc260x-pm.c b/drivers/mfd/atc260x-pm.c
+index 6e25f61e..e60bcde5 100755
+--- a/drivers/mfd/atc260x-pm.c
++++ b/drivers/mfd/atc260x-pm.c
+@@ -1383,8 +1383,15 @@ static int atc260x_pm_probe(struct platform_device *pdev)
+ 	
+ 	_set_s2_mode(atc260x_pm);
+ 	
++	/*
++	 * RG35XX: no RESET wake-up source while the system runs. Holding Power for 8 s makes the PMIC reset the
++	 * whole system (SYS_CTL2 ONOFF_PRESS_Reset_EN, the only way out of a hang), and with RESET_WK_EN set it
++	 * also switched the console straight back on: a hang came back after every forced restart. Without it the
++	 * long press leaves the console off; a normal power-on (ONOFF long-press wake-up) is unchanged, and the
++	 * reboot path (_atc2603c_9a_pm_do_reboot) enables the RESET wake-up itself just before its software reset.
++	 */
+ 	_atc260x_pm_set_wakeup_src_inner(atc260x_pm, OWL_PMIC_WAKEUP_SRC_ALL,
+-			OWL_PMIC_WAKEUP_SRC_RESET | OWL_PMIC_WAKEUP_SRC_HDSW |
++			OWL_PMIC_WAKEUP_SRC_HDSW |
+ 			OWL_PMIC_WAKEUP_SRC_ONOFF_LONG | OWL_PMIC_WAKEUP_SRC_WALL_IN |
+ 			OWL_PMIC_WAKEUP_SRC_VBUS_IN);
+ 	_clear_status(atc260x_pm);
+-- 
+2.53.0
+

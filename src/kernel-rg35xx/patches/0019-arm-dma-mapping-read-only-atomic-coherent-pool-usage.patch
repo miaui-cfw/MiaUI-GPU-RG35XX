@@ -1,0 +1,64 @@
+From e0e2dac76417bdbd004eac5471060d54ad939e82 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:45:23 +0100
+Subject: [PATCH] arm dma-mapping: read-only atomic coherent pool usage
+ counters
+
+mach-owl sizes the atomic coherent pool at 14 MB; it is carved out of CMA at boot and stays pinned. Count
+the pages in use and the peak, exported read-only as
+/sys/module/dma_mapping/parameters/atomic_pool_{used,peak,size}_pages, to size the pool from real use.
+---
+ arch/arm/mm/dma-mapping.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index 1d8c7f3e..5aad95e2 100755
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -10,6 +10,7 @@
+  *  DMA uncached mapping support.
+  */
+ #include <linux/module.h>
++#include <linux/moduleparam.h>
+ #include <linux/mm.h>
+ #include <linux/gfp.h>
+ #include <linux/errno.h>
+@@ -479,6 +480,16 @@ static void *__alloc_remap_buffer(struct device *dev, size_t size, gfp_t gfp,
+ 	return ptr;
+ }
+ 
++/*
++ * RG35XX: how much of the atomic coherent pool is really used. mach-owl sizes the pool at 14 MB (taken from
++ * CMA at boot and pinned for good); these read-only counters, in pages, tell what it can be shrunk to:
++ * /sys/module/dma_mapping/parameters/atomic_pool_{used,peak,size}_pages.
++ */
++static unsigned int atomic_pool_used_pages, atomic_pool_peak_pages, atomic_pool_size_pages;
++module_param_named(atomic_pool_used_pages, atomic_pool_used_pages, uint, 0444);
++module_param_named(atomic_pool_peak_pages, atomic_pool_peak_pages, uint, 0444);
++module_param_named(atomic_pool_size_pages, atomic_pool_size_pages, uint, 0444);
++
+ static void *__alloc_from_pool(size_t size, struct page **ret_page)
+ {
+ 	struct dma_pool *pool = &atomic_pool;
+@@ -506,6 +517,10 @@ static void *__alloc_from_pool(size_t size, struct page **ret_page)
+ 	if (pageno < pool->nr_pages) {
+ 		bitmap_set(pool->bitmap, pageno, count);
+ 		ptr = pool->vaddr + PAGE_SIZE * pageno;
++		atomic_pool_size_pages = pool->nr_pages;
++		atomic_pool_used_pages += count;
++		if (atomic_pool_used_pages > atomic_pool_peak_pages)
++			atomic_pool_peak_pages = atomic_pool_used_pages;
+ 		*ret_page = pool->pages[pageno];
+ 	} else {
+ 		pr_err_once("ERROR: %u KiB atomic DMA coherent pool is too small!\n"
+@@ -550,6 +565,7 @@ static int __free_from_pool(void *start, size_t size)
+ 
+ 	spin_lock_irqsave(&pool->lock, flags);
+ 	bitmap_clear(pool->bitmap, pageno, count);
++	atomic_pool_used_pages -= count;
+ 	spin_unlock_irqrestore(&pool->lock, flags);
+ 
+ 	return 1;
+-- 
+2.53.0
+

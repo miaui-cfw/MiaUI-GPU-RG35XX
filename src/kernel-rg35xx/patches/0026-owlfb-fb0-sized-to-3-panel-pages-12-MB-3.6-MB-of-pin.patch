@@ -1,0 +1,73 @@
+From 3ea54962e868082b436b03d9d88be548e52255ee Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Wed, 25 Nov 2026 10:05:44 +0100
+Subject: [PATCH] owlfb: fb0 sized to 3 panel pages (12 MB -> 3.6 MB of pinned
+ CMA)
+
+fb0 was 5 double-buffered 640x480x32 screens (12,288,000 bytes, room for 10 GPU buffers). The PVR swap
+chain uses 3 (y offsets 0/480/960, measured during the FIFO underflow work) and MinUI 2 pages; at 16 bpp
+the same memory holds 6. 3 pages = 3,686,400 bytes. The overlay reserve (only requested by test tools)
+starts at page 2, inside the region, as before.
+---
+ drivers/video/owl/fb/owlfb-main.c | 8 ++++----
+ drivers/video/owl/fb/owlfb.h      | 9 +++++++--
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/video/owl/fb/owlfb-main.c b/drivers/video/owl/fb/owlfb-main.c
+index 56144e3f..9416292f 100755
+--- a/drivers/video/owl/fb/owlfb-main.c
++++ b/drivers/video/owl/fb/owlfb-main.c
+@@ -1287,10 +1287,10 @@ static int owlfb_alloc_fbmem(struct fb_info *fbi, unsigned long size)
+ /**
+  * @brief Allocates a framebuffer's memory, sized from its display.
+  * @param fbi     The framebuffer.
+- * @param screens RG35XX: number of double-buffered screens of the display's resolution.
++ * @param pages   RG35XX: number of pages (screens) of the display's resolution.
+  * @return 0 (also without a display) or a negative error.
+  */
+-static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned int screens)
++static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned int pages)
+ {
+ 	unsigned long size;
+ 	struct owlfb_info *ofbi = FB2OFB(fbi);
+@@ -1320,7 +1320,7 @@ static int owlfb_alloc_fbmem_display(struct fb_info *fbi, unsigned int screens)
+ 
+ 		display->driver->get_resolution(display, &w, &h);
+ 
+-		size = w * h * bytespp * OWLFB_NUM_BUFFERS_PER_FB * screens;
++		size = w * h * bytespp * pages;
+ 
+ 	}
+ 
+@@ -1341,7 +1341,7 @@ static int owlfb_allocate_all_fbs(struct owlfb_device *fbdev)
+ 		 */
+ 		if (i > 0)
+ 			continue;
+-		r = owlfb_alloc_fbmem_display(fbdev->fbs[i], OWLFB_FB0_SCREENS);
++		r = owlfb_alloc_fbmem_display(fbdev->fbs[i], OWLFB_FB0_PAGES);
+ 		if (r)
+ 			return r;		
+ 	}
+diff --git a/drivers/video/owl/fb/owlfb.h b/drivers/video/owl/fb/owlfb.h
+index 698e73fb..5db5de05 100755
+--- a/drivers/video/owl/fb/owlfb.h
++++ b/drivers/video/owl/fb/owlfb.h
+@@ -50,8 +50,13 @@ extern bool owlfb_debug;
+ #define OWLFB_NUM_FBS        2
+ #define OWLFB_MAX_OVL_PER_FB 2	/* RG35XX: fb0 drives overlays 0 and 1 */
+ #define OWLFB_NUM_BUFFERS_PER_FB 2
+-/* RG35XX: fb0 memory, in double-buffered screens: pages for userspace, then the overlay and cursor reserve */
+-#define OWLFB_FB0_SCREENS 5
++/*
++ * RG35XX: fb0 memory, in pages of the panel at 32 bpp (640x480x4 = 1.2 MB). 3 = the GPU swap chain (PVR
++ * flips between y offsets 0/480/960, measured) and covers MinUI's 2 pages; at 16 bpp the same memory holds 6.
++ * The overlay reserve starts at page 2 (overlay_mem_base), inside it; only test tools request an overlay.
++ * Was 5 double-buffered screens (10 pages, 12 MB of pinned CMA).
++ */
++#define OWLFB_FB0_PAGES 3
+ 
+ #define OWLFB_BUFFERS_MAX_XRES 1920
+ #define OWLFB_BUFFERS_MAX_YRES 1080
+-- 
+2.53.0
+

@@ -1,0 +1,62 @@
+From fa182bf569cfa2f95a2b46b19bed0650c3eac678 Mon Sep 17 00:00:00 2001
+From: kernel-rg35xx <build@localhost>
+Date: Tue, 24 Nov 2026 22:15:16 +0100
+Subject: [PATCH 1/2] owlfb: release the boot-logo reservation (9 MB) after the
+ first fb0 apply
+
+owl_reserve() keeps the "tiny fb" region (fb_heap_size, 9 MB at the top of RAM) for the bootloader's
+logo screen and frees it only from dss_mgr_check_and_enable_mmu(), when the DE MMU gets enabled. The
+RG35XX never enables it, so the 9 MB stayed reserved for the whole session (the boot log only shows the
+1 MB KINFO release). The display scans the U-Boot buffer until fb0 is first applied from user space
+(no fbcon; the init-time apply does not reach the hardware), and the ramdisk draws its progress dots
+there before that. Release the region from a work item 200 ms after the first non-init apply of fb0.
+---
+ drivers/video/owl/fb/owlfb-main.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/drivers/video/owl/fb/owlfb-main.c b/drivers/video/owl/fb/owlfb-main.c
+index e7c5965e..7b40419a 100755
+--- a/drivers/video/owl/fb/owlfb-main.c
++++ b/drivers/video/owl/fb/owlfb-main.c
+@@ -671,6 +671,26 @@ err:
+  * @param skip_ovl1 RG35XX: leave overlay 1 untouched (pan_display while no overlay is disabled by userspace).
+  * @return 0 or a negative error.
+  */
++/*
++ * RG35XX: give back the bootloader's logo screen.
++ *
++ * owl_reserve() keeps the "tiny fb" region (9 MB at the top of RAM, where U-Boot draws its logo and the ramdisk
++ * its progress dots) and the vendor code frees it only when the DE MMU gets enabled, which never happens on this
++ * board: the 9 MB stayed reserved for good. The display scans that buffer until fb0 is first applied from user
++ * space (no fbcon, and the init-time apply does not reach the hardware); the region is released a few frames after
++ * that first apply, from a work item (free_fb_reserved_memory() is idempotent).
++ */
++extern void free_fb_reserved_memory(void);
++
++/** @brief Work item: release the boot-logo reservation to the page allocator. */
++static void owlfb_free_boot_fb(struct work_struct *work)
++{
++	free_fb_reserved_memory();
++	pr_info("owlfb: boot logo memory released\n");
++}
++static DECLARE_DELAYED_WORK(owlfb_free_boot_fb_work, owlfb_free_boot_fb);
++static bool owlfb_boot_fb_release_queued;
++
+ int owlfb_apply_changes(struct fb_info *fbi, int init, int skip_ovl1)
+ {
+ 	int r = 0;
+@@ -795,6 +815,11 @@ int owlfb_apply_changes(struct fb_info *fbi, int init, int skip_ovl1)
+ 			dest_ovl->manager->apply(dest_ovl->manager);
+ 		}
+ 	}
++	/* fb0 now reaches the display: the boot logo buffer is free once this has latched (200 ms = 12 frames) */
++	if (!init && ofbi->id == 0 && !owlfb_boot_fb_release_queued) {
++		owlfb_boot_fb_release_queued = true;
++		schedule_delayed_work(&owlfb_free_boot_fb_work, msecs_to_jiffies(200));
++	}
+ 	return 0;
+ err:
+ 	DBG("apply_changes failed\n");
+-- 
+2.53.0
+
