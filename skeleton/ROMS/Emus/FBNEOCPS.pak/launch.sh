@@ -1,6 +1,6 @@
 #!/bin/sh
 
-EMU_EXE=fbalpha2012_cps3
+EMU_EXE=fbneo_cps
 
 ###############################
 

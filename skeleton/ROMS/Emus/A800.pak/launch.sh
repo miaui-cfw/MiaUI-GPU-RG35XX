@@ -1,6 +1,6 @@
 #!/bin/sh
 
-EMU_EXE=fbalpha2012_cps2
+EMU_EXE=atari800
 
 ###############################
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 
-EMU_EXE=picodrive
+EMU_EXE=genesis_plus_gx
 
 # para que funcione el overlay este "export" es muy importante
 export PAK_PATH=$(dirname "$0")

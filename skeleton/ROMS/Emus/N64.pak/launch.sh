@@ -1,32 +1,15 @@
 #!/bin/sh
 
-if [ ! -d /userdata/Profile/configs/mupen64 ];then
-	mkdir -p /userdata/Profile/configs/mupen64
-	cp -r /usr/share/mupen64/* /userdata/Profile/configs/mupen64/
-fi
+EMU_EXE=parallel_n64
 
-overclock.elf 1488000
-
-cd /userdata/Profile/configs/mupen64
+###############################
 
 EMU_TAG=$(basename "$(dirname "$0")" .pak)
 ROM="$1"
-EMU_SAVES="$SAVES_PATH/$EMU_TAG"
+mkdir -p "$BIOS_PATH/$EMU_TAG"
+mkdir -p "$SAVES_PATH/$EMU_TAG"
+HOME="$USERDATA_PATH"
+cd "$HOME"
 
-mkdir -p "$EMU_SAVES"
-
-HOME="$EMU_SAVES"
-echo $HOME
-export HOME
-
-# Comprobamos todas las variantes: [RISE], [rise], (RISE), (rise)
-case "$ROM" in
-  *"[RISE]"* | *"[rise]"* | *"(RISE)"* | *"(rise)"*)
-    # más básico fallan sombras
-    mupen64plus --corelib /usr/lib/libmupen64plus.so.2.0.0 --gfx /usr/lib/mupen64plus/mupen64plus-video-glide64mk2.so --configdir /userdata/Profile/configs/mupen64/ --datadir /userdata/Profile/configs/mupen64/ "$ROM"
-    ;;
-  *)    
-    mupen64plus --corelib /usr/lib/libmupen64plus.so.2.0.0 --gfx /usr/lib/mupen64plus/mupen64plus-video-rice.so --configdir /userdata/Profile/configs/mupen64/ --datadir /userdata/Profile/configs/mupen64/ "$ROM"
-    ;;
-esac
-
+# hardware rendering core: --gl gives it a GLES2 context and a 32-bit window
+minarch.elf --gl565 "$CORES_PATH/${EMU_EXE}_libretro.so" "$ROM"

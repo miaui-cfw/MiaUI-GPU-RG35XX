@@ -1,24 +1,18 @@
 #!/bin/sh
 
+EMU_EXE=ppsspp
 
-if [ ! -d /userdata/Profile/configs/ppsspp ];then
-	mkdir -p /userdata/Profile/configs/ppsspp
-	cp -r /usr/share/ppsspp/* /userdata/Profile/configs/ppsspp/
-fi
+###############################
 
-cp /usr/share/evmapy/psp.ppsspp.keys /var/run/evmapy/event1.json
-evmapy &
-
-overclock.elf 1488000
-
-cd /userdata/Profile/configs/ppsspp
-
-export SDL_GAMECONTROLLERCONFIG=$(grep "RG35XX" "${HOME}/.config/gamecontrollerdb.txt")
+EMU_TAG=$(basename "$(dirname "$0")" .pak)
 ROM="$1"
-
+mkdir -p "$BIOS_PATH/$EMU_TAG"
+mkdir -p "$SAVES_PATH/$EMU_TAG"
+# PPSSPP wants its assets (fonts, flash0) in <system dir>/PPSSPP: use the
+# standalone install's read-only copy rather than duplicating ~20MB of it
+[ -e "$BIOS_PATH/$EMU_TAG/PPSSPP" ] || ln -s /usr/share/ppsspp/PPSSPP "$BIOS_PATH/$EMU_TAG/PPSSPP"
 HOME="$USERDATA_PATH"
-echo $HOME
+cd "$HOME"
 
-PPSSPP "$ROM"
-
-killall evmapy
+# hardware rendering core: --gl gives it a GLES2 context and a 32-bit window
+minarch.elf --gl "$CORES_PATH/${EMU_EXE}_libretro.so" "$ROM"
